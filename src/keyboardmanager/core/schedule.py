@@ -67,11 +67,12 @@ class Schedule:
             return Schedule("once", at=parse_at(self.at).strftime(AT_FORMAT))
         if self.kind == "weekly":
             hour, minute = parse_clock(self.time)
+            # check the types before sorting: mixed types cannot be sorted (TypeError)
+            if any(not isinstance(d, int) or isinstance(d, bool) or d not in ALL_DAYS for d in self.days):
+                raise ValueError("schedule days must be 0 (Monday) to 6 (Sunday)")
             days = tuple(sorted(set(self.days)))
             if not days:
                 raise ValueError("pick at least one day for the schedule")
-            if any(not isinstance(d, int) or d not in ALL_DAYS for d in days):
-                raise ValueError("schedule days must be 0 (Monday) to 6 (Sunday)")
             return Schedule("weekly", time=f"{hour:02d}:{minute:02d}", days=days)
         if self.kind == "interval":
             if not isinstance(self.minutes, int) or isinstance(self.minutes, bool) or not (

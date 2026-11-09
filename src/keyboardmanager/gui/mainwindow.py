@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import time
-
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from keyboardmanager.core import io as macro_io
 from keyboardmanager.core import keys
+from keyboardmanager.core import permissions
 from keyboardmanager.core.database import Database
 from keyboardmanager.core.models import Macro
 from keyboardmanager.core.schedule import format_when
@@ -145,6 +144,21 @@ class MainWindow(QMainWindow):
         self.service.reload()
         self._update_status()
         self._select(None)
+        # Cmd+Q, Dock > Quit and logging out send the application a Quit event
+        QApplication.instance().installEventFilter(self)
+        self._check_permissions()
+
+    # ------------------------------------------------------------- permissions
+    def _check_permissions(self) -> None:
+        missing = permissions.missing_permissions()
+        if not missing:
+            return
+        warning = QLabel("Permissions missing")
+        warning.setStyleSheet("color: #c62828; font-weight: bold;")
+        warning.setToolTip(permissions.explain(missing))
+        self.statusBar().addPermanentWidget(warning)
+        self.permission_warning = warning
+        QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Permissions needed", permissions.explain(missing)))
 
     # -------------------------------------------------------------------- tray
     def _setup_tray(self) -> None:
@@ -183,11 +197,28 @@ class MainWindow(QMainWindow):
             self.tray.hide()
         QApplication.quit()
 
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt API
+        if (
+            event.type() == QEvent.Type.Quit
+            and obj is QApplication.instance()
+            and not self._quitting
+        ):
+            # The whole application is quitting (not just this window closing):
+            # ask about unsaved edits, then let closeEvent accept instead of hiding
+            # to the tray. Ignoring the event cancels the quit (and a logout).
+            if not self._confirm_discard():
+                event.ignore()
+                return True
+            self._quitting = True
+        return super().eventFilter(obj, event)
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         if self._quitting or self.tray is None:
-            if not self._quitting and not self._confirm_discard():
-                event.ignore()
-                return
+            if not self._quitting:
+                if not self._confirm_discard():
+                    event.ignore()
+                    return
+                self._quitting = True
             self.service.shutdown()
             event.accept()
             QApplication.quit()
@@ -321,7 +352,7 @@ class MainWindow(QMainWindow):
             if when is None:
                 saved += " - its scheduled time has already passed, so it will not run"
             elif self.service.schedules_enabled:
-                saved += f" - next run {format_when(when, time.time())}"
+                saved += f" - next run {format_when(when, self.service.clock())}"
         self.statusBar().showMessage(saved, 6000)
         if macro.hotkey in failures:
             QMessageBox.warning(self, "Hotkey", f"Could not register {macro.hotkey}: {failures[macro.hotkey]}")
@@ -429,7 +460,7 @@ class MainWindow(QMainWindow):
             text = "Schedules are switched off"
         else:
             when = self.service.next_run(saved.id)  # type: ignore[arg-type]
-            text = f"Next run: {format_when(when, time.time())}" if when else "No upcoming run"
+            text = f"Next run: {format_when(when, self.service.clock())}" if when else "No upcoming run"
         self.editor.schedule_status.setText(text)
 
     def _change_stop_hotkey(self) -> None:
@@ -495,7 +526,7 @@ class MainWindow(QMainWindow):
         if not upcoming:
             return "Schedules: none"
         when, macro = upcoming[0]
-        return f'Schedules: {len(upcoming)}, next "{macro.name}" {format_when(when, time.time())}'
+        return f'Schedules: {len(upcoming)}, next "{macro.name}" {format_when(when, self.service.clock())}'
 
     # ------------------------------------------------------------ import/export
     def _export(self) -> None:

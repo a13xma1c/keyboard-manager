@@ -43,14 +43,16 @@ from keyboardmanager.core.schedule import (
 _K = Qt.Key
 _IS_MAC = sys.platform == "darwin"
 
-# Qt reports Command as "Control" and Control as "Meta" on macOS.
-_MODIFIER_KEYS = {
-    _K.Key_Control: "cmd" if _IS_MAC else "ctrl",
-    _K.Key_Meta: "ctrl" if _IS_MAC else "cmd",
-    _K.Key_Alt: "alt",
-    _K.Key_AltGr: "alt",
-    _K.Key_Shift: "shift",
-}
+
+def _modifier_keys() -> dict:
+    # Qt reports Command as "Control" and Control as "Meta" on macOS.
+    return {
+        _K.Key_Control: "cmd" if _IS_MAC else "ctrl",
+        _K.Key_Meta: "ctrl" if _IS_MAC else "cmd",
+        _K.Key_Alt: "alt",
+        _K.Key_AltGr: "alt",
+        _K.Key_Shift: "shift",
+    }
 
 _NAMED = {
     _K.Key_Return: "enter", _K.Key_Enter: "enter", _K.Key_Escape: "esc", _K.Key_Tab: "tab",
@@ -69,8 +71,9 @@ def qt_key_name(key: int) -> str | None:
         qk = _K(key)
     except ValueError:
         qk = None
-    if qk in _MODIFIER_KEYS:
-        return _MODIFIER_KEYS[qk]
+    modifiers = _modifier_keys()
+    if qk in modifiers:
+        return modifiers[qk]
     if qk in _NAMED:
         return _NAMED[qk]
     if _K.Key_F1 <= key <= _K.Key_F24:
@@ -173,7 +176,9 @@ class KeyCaptureEdit(QWidget):
             return
         if name in keys.MODIFIERS:
             self._pending = name
-            self.button.setText("+".join(qt_modifier_names(event)) + "+...")
+            # some platforms leave the modifier being pressed out of modifiers()
+            held = set(qt_modifier_names(event)) | {name}
+            self.button.setText("+".join(m for m in keys.MODIFIERS if m in held) + "+...")
             return
         self._pending = None
         if self.mode == "key":

@@ -55,12 +55,21 @@ on Windows, `~/.local/share/KeyboardManager` on Linux) unless `--db` is given.
 
 ## Platform notes
 
-* **macOS**: the `keyboard` package crashes the interpreter on import here, so
-  hotkeys always use pynput regardless of `--hotkey-backend`. Grant **Accessibility** and **Input Monitoring** to the terminal (or app)
-  that launches Keyboard Manager (System Settings > Privacy & Security). Without it
-  recording, injection and global hotkeys do nothing. Window titles of other apps
-  additionally need **Screen Recording**; application names work without it. `cmd`
-  means the Command key.
+* **macOS** (14 Sonoma or newer with the locked dependencies, Intel or Apple silicon):
+  grant **Accessibility** and **Input Monitoring** to the app that launches Keyboard
+  Manager (Terminal, iTerm, ...) in System Settings > Privacy & Security, then restart
+  it. macOS gives no error without them (hotkeys never fire, recordings stay empty),
+  so Keyboard Manager checks at start-up and shows which one is missing. Window
+  titles of other apps additionally need **Screen Recording**; application names work
+  without it. `cmd` is the Command key and `alt` the Option key: Option shortcuts such
+  as `ctrl+alt+s` work for hotkeys and recordings even though Option changes the
+  typed character (the current keyboard layout is read when hotkeys are registered).
+  On laptops the F-keys of the stop / pause hotkeys may need `fn`. The `keyboard`
+  package crashes the interpreter on import on macOS, so it is not installed there
+  and hotkeys always use pynput. Cmd+Q quits (asking about unsaved changes); closing
+  the window keeps the app running in the menu bar.
+  For macOS 12-13: `uv pip install . "PySide6<6.12"` (13) or `"PySide6<6.10"` (12),
+  since newer PySide6 wheels need macOS 14.
 * **Windows**: works out of the box; `cmd` means the Windows key. The `keyboard`
   package is used for hotkeys, with automatic fallback to pynput.
 * **Linux**: X11 only (Wayland blocks global hooks). Application/window conditions
@@ -114,5 +123,27 @@ tests/       pytest (executor, recorder, service and database use fakes; GUI run
 ## Development
 
 ```bash
-uv run pytest
+uv run pytest                                  # everything (~300 tests, ~20 s)
+uv run pytest --cov=keyboardmanager            # with coverage
+uv run pytest tests/test_macos.py              # macOS behaviour, on any OS
+uv run pytest -m native                        # only tests using the real OS APIs
+xvfb-run -a uv run pytest                      # headless Linux (pynput needs an X display)
 ```
+
+The suite never touches real input devices: a fake backend records injected input,
+and hotkey hooks, listeners and the clock are faked. Qt runs on the offscreen
+platform. Platform code for macOS, Windows and Linux is tested on every OS by
+simulating `sys.platform` and the native modules (AppKit, Quartz, HIServices, Win32);
+tests marked `native` additionally run against the real APIs where available.
+CI (`.github/workflows/tests.yml`) runs the suite on Linux, Windows, macOS 14 and
+the latest macOS, with Python 3.10 and 3.13.
+
+| Tests | Cover |
+| --- | --- |
+| `test_keys`, `test_actions_catalog`, `test_models_actions` | key names, action validation, descriptions |
+| `test_executor`, `test_service`, `test_schedule` | running, pause/resume, stop, hotkeys, scheduling |
+| `test_recorder`, `test_backend`, `test_hotkeys`, `test_windowinfo` | input recording, injection, hotkey backends, active window |
+| `test_macos` | Mac APIs, permissions, Option-key hotkeys/recording, dependencies |
+| `test_database_io` | storage, migrations, import/export |
+| `test_gui*`, `test_app` | window, editor, dialogs, tray, quitting, start-up |
+| `test_integration` | the whole application with only the OS faked |

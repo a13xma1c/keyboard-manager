@@ -17,7 +17,8 @@ from keyboardmanager.core.actions import new_action
 from keyboardmanager.core.models import Action
 
 # Raw event: (timestamp_seconds, kind, data)
-#   key_down / key_up : data = canonical key name
+#   key_down          : data = canonical key name, or (name, typed character)
+#   key_up            : data = canonical key name
 #   move              : data = (x, y)
 #   click             : data = (x, y, button, pressed)
 #   scroll            : data = (x, y, dx, dy)
@@ -81,7 +82,7 @@ class _Builder:
         return a
 
     # -- events
-    def on_key_down(self, t: float, key: str) -> None:
+    def on_key_down(self, t: float, key: str, char: str | None = None) -> None:
         if key in self.down_keys:  # auto-repeat
             return
         self.down_keys.add(key)
@@ -94,7 +95,8 @@ class _Builder:
         self.consumed.add(key)
         hidden = [m for m in active if not self.mods[m]["down_emitted"]]
         printable = len(key) == 1 or key in ("space", "plus")
-        text_char = " " if key == "space" else "+" if key == "plus" else key
+        # the character actually typed keeps its case ("H"); the key name does not
+        text_char = char or (" " if key == "space" else "+" if key == "plus" else key)
         only_shift = all(m == "shift" for m in hidden)
         if printable and only_shift and len(hidden) == len(active):
             # Typing: shift only changes the character, which we already received.
@@ -207,7 +209,10 @@ def build_actions(events: list[Event], options: RecordOptions | None = None) -> 
     b = _Builder(options or RecordOptions())
     for t, kind, data in events:
         if kind == "key_down":
-            b.on_key_down(t, data)  # type: ignore[arg-type]
+            if isinstance(data, tuple):
+                b.on_key_down(t, *data)
+            else:
+                b.on_key_down(t, data)  # type: ignore[arg-type]
         elif kind == "key_up":
             b.on_key_up(t, data)  # type: ignore[arg-type]
         elif kind == "move":
@@ -243,7 +248,13 @@ class Recorder:
         self._lock = threading.Lock()
         self._kb = None
         self._mouse = None
-        self._ctrl_held = 0
+        # physical ctrl / alt / cmd keys currently down -> canonical name. A set of the
+        # keys themselves (not a counter) because held keys auto-repeat on some systems.
+        self._held: dict[object, str] = {}
+        # physical key -> name recorded at key down, reused for its key up so the
+        # pair always matches (e.g. Option released before the letter on macOS)
+        self._down_names: dict[object, str] = {}
+        self._base_chars: dict[int, str] = {}
         self._stop_key_down = False
         self._active = False
 
@@ -254,9 +265,13 @@ class Recorder:
     def start(self) -> None:
         from pynput import keyboard, mouse
 
+        from keyboardmanager.core.backend import darwin_base_chars
+
         if self._active:
             return
         self._events = []
+        self._held, self._down_names = {}, {}
+        self._base_chars = darwin_base_chars()  # on the calling (GUI) thread, see its docs
         self._active = True
         self._kb = keyboard.Listener(on_press=self._press, on_release=self._release)
         self._mouse = mouse.Listener(
@@ -289,30 +304,45 @@ class Recorder:
     def _name(self, key) -> str | None:
         from keyboardmanager.core.backend import pynput_key_to_name
 
-        return pynput_key_to_name(key, ctrl_held=self._ctrl_held > 0)
+        # With ctrl / alt / cmd held the key is a shortcut, so record the key itself
+        # (macOS Option+S -> "alt+s", not "alt+ß"). Shift alone is typing: keep "S".
+        return pynput_key_to_name(
+            key, ctrl_held="ctrl" in self._held.values(),
+            base_chars=self._base_chars if self._held else None,
+        )
+
+    @staticmethod
+    def _ident(key) -> object:
+        """Identity of the physical key: its key code when known, else the key."""
+        vk = getattr(key, "vk", None)
+        return ("vk", vk) if vk is not None else key
 
     def _press(self, key) -> None:
         name = self._name(key)
         if name is None:
             return
+        self._down_names[self._ident(key)] = name
         if name == self.options.stop_key:
             if not self._stop_key_down:
                 self._stop_key_down = True
                 self._active_stop()
             return
-        if name == "ctrl":
-            self._ctrl_held += 1
-        self._add("key_down", name)
+        if name in ("ctrl", "alt", "cmd"):
+            self._held[self._ident(key)] = name
+        char = getattr(key, "char", None)
+        if not self._held and isinstance(char, str) and len(char) == 1 and char.isprintable():
+            self._add("key_down", (name, char))  # typing: keep the exact character
+        else:
+            self._add("key_down", name)
 
     def _release(self, key) -> None:
-        name = self._name(key)
+        name = self._down_names.pop(self._ident(key), None) or self._name(key)
         if name is None:
             return
         if name == self.options.stop_key:
             self._stop_key_down = False
             return
-        if name == "ctrl":
-            self._ctrl_held = max(0, self._ctrl_held - 1)
+        self._held.pop(self._ident(key), None)
         self._add("key_up", name)
 
     def _active_stop(self) -> None:

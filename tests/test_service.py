@@ -4,21 +4,7 @@ from keyboardmanager.core import actions as catalog
 from keyboardmanager.core.backend import pynput_key_to_name
 from keyboardmanager.core.models import ActiveWindow, Macro
 from keyboardmanager.core.service import MacroService
-
-
-class FakeHotkeys:
-    name = "fake"
-
-    def __init__(self):
-        self.mapping = {}
-        self.stopped = False
-
-    def start(self, mapping):
-        self.mapping = dict(mapping)
-        return {}
-
-    def stop(self):
-        self.stopped = True
+from tests_support import FakeHotkeys
 
 
 def make(db, backend, **kw):
@@ -209,7 +195,7 @@ def test_pause_and_resume_running_macro(db, backend):
     threading.Event().wait(0.3)
     assert svc.running_macro is not None and backend.calls == []
     assert svc.resume() and not svc.paused
-    assert wait_until(lambda: svc.running_macro is None)
+    assert wait_until(lambda: "finished" in events)
     assert ("down", "z") in backend.calls
     assert [e for e in events if e != "hotkeys"] == ["started", "paused", "resumed", "finished"]
     assert db.list_history()[0].status == "success"
@@ -280,3 +266,27 @@ def test_existing_macro_keeps_hotkey_that_clashes_with_pause_hotkey(db, backend)
     assert "ctrl+alt+f11" in failures and '"mine"' in failures["ctrl+alt+f11"]
     hk.mapping["ctrl+alt+f11"]()
     assert wait_until(lambda: ("down", "m") in backend.calls)
+
+
+def test_history_is_complete_once_the_macro_is_no_longer_running(db, backend):
+    """Callers (GUI, tests) may read the history as soon as running_macro is None."""
+    m = save(db, "quick")
+    svc, _, _ = make(db, backend)
+    for _ in range(30):
+        assert svc.run(m)
+        assert wait_until(lambda: svc.running_macro is None)
+        assert db.list_history()[0].status == "success"
+
+
+def test_database_failure_does_not_leave_the_service_busy(db, backend, monkeypatch):
+    m = save(db, "a")
+    svc, _, _ = make(db, backend)
+
+    def broken(*args):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(db, "finish_history", broken)
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)  # the worker's error is expected
+    svc.run(m)
+    assert wait_until(lambda: svc.running_macro is None)
+    assert svc.run(m)  # not stuck

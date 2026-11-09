@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 = Sonoma, the oldest macOS the locked PySide6 (6.12) supports
+        os: [ubuntu-latest, windows-latest, macos-14, macos-latest]
+        python: ["3.10", "3.13"]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Qt runtime libraries and a virtual X server (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libdbus-1-3
+
+      - name: Install
+        run: uv sync --locked
+
+      # pynput needs an X display on Linux, so the tests run inside Xvfb there
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a uv run pytest -ra --cov=keyboardmanager --cov-report=term-missing
+
+      - name: Test
+        if: runner.os != 'Linux'
+        run: uv run pytest -ra --cov=keyboardmanager --cov-report=term-missing
+
+      - name: macOS-specific tests ran natively
+        if: runner.os == 'macOS'
+        run: uv run pytest -ra -m native tests/test_macos.py

@@ -7,6 +7,7 @@ importing this module never requires a display server.
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Protocol
 
 from keyboardmanager.core import keys
@@ -36,13 +37,53 @@ _MODIFIER_NAMES = {
 }
 
 
-def pynput_key_to_name(key: Any, ctrl_held: bool = False) -> str | None:
+def darwin_base_chars() -> dict[int, str]:
+    """macOS: key code -> character the key types *without* modifiers, for the
+    current keyboard layout. ``{}`` on other platforms or if unavailable.
+
+    On macOS pynput reports the composed character, so Option+S arrives as ``ß``
+    and Option+K as ``˚``; this table maps such keys back to ``s`` / ``k``. Uses the
+    macOS text input APIs, so call it on the main thread (hotkeys are registered
+    and recordings started from the GUI thread).
+    """
+    if sys.platform != "darwin":
+        return {}
+    try:
+        from pynput._util.darwin import keycode_context, keycode_to_string
+
+        table: dict[int, str] = {}
+        with keycode_context() as context:
+            for vk in range(128):
+                char = keycode_to_string(context, vk)
+                if len(char) == 1 and char.isprintable() and not char.isspace():
+                    table[vk] = char.lower()
+        return table
+    except Exception:  # noqa: BLE001 - fall back to pynput's characters
+        return {}
+
+
+def base_key(key: Any, base_chars: dict[int, str]) -> Any:
+    """Replace a character key by its unmodified character (see ``darwin_base_chars``)."""
+    vk = getattr(key, "vk", None)
+    if getattr(key, "char", None) is None or vk not in base_chars:
+        return key
+    from pynput.keyboard import KeyCode
+
+    return KeyCode.from_char(base_chars[vk], vk=vk)
+
+
+def pynput_key_to_name(
+    key: Any, ctrl_held: bool = False, base_chars: dict[int, str] | None = None
+) -> str | None:
     """Translate a key object received from a pynput listener to a canonical name.
 
     Returns ``None`` for keys we cannot represent. When ``ctrl_held`` is true a
     control character (what Windows reports for ctrl+letter) is mapped back to
-    its letter.
+    its letter. ``base_chars`` (pass it while ctrl / alt / cmd are held) maps keys
+    to their unmodified character, so macOS Option+S is ``s`` rather than ``ß``.
     """
+    if base_chars:
+        key = base_key(key, base_chars)
     name = getattr(key, "name", None)
     if name is not None:  # pynput.keyboard.Key member
         name = _MODIFIER_NAMES.get(name, name)

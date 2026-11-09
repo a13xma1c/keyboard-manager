@@ -42,6 +42,7 @@ class MacroService:
         self.listener = listener or (lambda event, payload: None)
         self.hotkeys_enabled = True
         self.schedules_enabled = True
+        self.clock = clock  # the scheduler's notion of "now" (injectable for tests)
         self.scheduler = Scheduler(
             run=lambda macro, trigger: self.run(macro, trigger=trigger),
             matches=lambda macro: macro.matches(self.backend.active_window()),
@@ -254,12 +255,15 @@ class MacroService:
         except Exception as exc:  # noqa: BLE001
             result = ExecutionResult("error", message=f"{type(exc).__name__}: {exc}")
         with self._events_lock:
-            with self._lock:
-                self._executor, self._running, self._paused = None, None, False
-                self._announced = False
-            self.db.finish_history(
-                history_id, result.status, result.duration_ms, result.actions_run, result.message
-            )
+            try:
+                # history first: once running_macro is None the run is fully recorded
+                self.db.finish_history(
+                    history_id, result.status, result.duration_ms, result.actions_run, result.message
+                )
+            finally:  # even if the database fails, the service must not stay "running"
+                with self._lock:
+                    self._executor, self._running, self._paused = None, None, False
+                    self._announced = False
             self.listener("finished", (macro, result))
 
     def shutdown(self) -> None:

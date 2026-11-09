@@ -178,9 +178,9 @@ def test_pause_between_steps_and_resume(backend):
     th, holder = start(ex, A("type_text", text="abcdefghij", interval_ms=20))
     assert wait_until(lambda: len(backend.calls) >= 2)
     ex.pause()
-    time.sleep(0.05)  # let the current character finish
+    time.sleep(0.15)  # let the current character finish
     frozen = len(backend.calls)
-    time.sleep(0.15)
+    time.sleep(0.25)
     assert len(backend.calls) == frozen and th.is_alive() and ex.paused
     ex.resume()
     th.join(2)
@@ -190,16 +190,16 @@ def test_pause_between_steps_and_resume(backend):
 
 def test_pause_freezes_remaining_delay(backend):
     ex = MacroExecutor(backend)
-    th, holder = start(ex, A("delay", ms=200), A("key_press", keys="a"))
+    th, holder = start(ex, A("delay", ms=1000), A("key_press", keys="a"))
     time.sleep(0.05)
     ex.pause()
-    time.sleep(0.3)  # well past the original delay
+    time.sleep(1.2)  # well past the original delay
     assert th.is_alive() and backend.calls == []
     resumed = time.monotonic()
     ex.resume()
-    th.join(2)
-    # roughly 150 ms of the delay were still left after resuming
-    assert time.monotonic() - resumed >= 0.1
+    th.join(3)
+    # most of the delay was still left after resuming
+    assert time.monotonic() - resumed >= 0.5
     assert holder["r"].status == "success" and ("down", "a") in backend.calls
 
 
@@ -262,3 +262,53 @@ def test_start_delay_is_pausable(backend):
     ex.resume()
     th.join(2)
     assert holder["r"].status == "success"
+
+
+# ------------------------------------------------------------- more branches
+import pytest  # noqa: E402
+
+from keyboardmanager.core import executor as executor_mod  # noqa: E402
+
+
+@pytest.mark.parametrize("value,op,other,expected", [
+    ("10", ">=", "10", True), ("9", "<=", "10", True), ("abc", "!=", "abd", True),
+    ("abc", "==", "ABC", False), ("b", ">", "a", True), ("10", "<", "abc", True),  # not both numbers: compared as text
+    ("Hello", "contains", "ELL", True), ("", "contains", "x", False),
+])
+def test_variable_comparisons_table(backend, value, op, other, expected):
+    run(backend, A("if", kind="variable", variable="v", op=op, compare_to=other,
+                   children=[A("key_press", keys="y")], else_children=[A("key_press", keys="n")]),
+        variables={"v": value})
+    assert backend.calls[0] == ("down", "y" if expected else "n")
+
+
+def test_explicit_key_up_and_mouse_release_clear_held_state(backend):
+    r = run(backend, A("key_down", key="alt"), A("key_up", key="alt"),
+            A("mouse_click", button="left", state="press"), A("mouse_click", button="left", state="release"),
+            A("key_up", key="ctrl"))  # releasing a key that is not held is harmless
+    assert r.status == "success"
+    assert backend.calls == [("down", "alt"), ("up", "alt"), ("mdown", "left"), ("mup", "left"), ("up", "ctrl")]
+
+
+def test_release_failures_do_not_hide_the_original_error(backend):
+    def broken_up(key):
+        raise RuntimeError("release failed")
+
+    backend.key_up = broken_up
+    backend.mouse_up = broken_up
+    r = run(backend, A("key_down", key="shift"), A("mouse_click", button="left", state="press"),
+            A("set_variable", name="n", value="x", mode="add"))
+    assert r.status == "error" and "not a number" in r.message
+
+
+def test_runaway_macros_hit_the_action_limit(backend, monkeypatch):
+    monkeypatch.setattr(executor_mod, "MAX_ACTIONS", 50)
+    r = run(backend, A("repeat", count=0, children=[A("set_variable", name="x", value="1")]))
+    assert r.status == "error" and "action limit" in r.message
+
+
+def test_relative_mouse_move_and_time_condition_at_midnight(backend):
+    run(backend, A("mouse_move", x=-10, y=5, relative=True),
+        A("if", kind="time", value="23:00-01:00", children=[A("key_press", keys="m")]),
+        now=lambda: datetime(2030, 1, 1, 0, 30))
+    assert backend.calls == [("move", 90, 105), ("down", "m"), ("up", "m")]

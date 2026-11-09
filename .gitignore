@@ -7,4 +7,5 @@ build/
 .pytest_cache/
 .bob/
 *.db
+.coverage
 .idea/

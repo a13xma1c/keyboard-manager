@@ -32,6 +32,33 @@ class HotkeyBackend(Protocol):
     def stop(self) -> None: ...
 
 
+_LAYOUT_AWARE_CLASS = None
+
+
+def layout_aware_hotkeys_class():
+    """``pynput.keyboard.GlobalHotKeys`` that matches keys by their unmodified
+    character where the platform reports composed ones (macOS: Option+S is ``ß``),
+    so hotkeys such as ``ctrl+alt+s`` fire. Created lazily: importing this module
+    must not require pynput.
+    """
+    global _LAYOUT_AWARE_CLASS
+    if _LAYOUT_AWARE_CLASS is None:
+        from pynput import keyboard
+
+        from keyboardmanager.core.backend import base_key
+
+        class LayoutAwareGlobalHotKeys(keyboard.GlobalHotKeys):
+            def __init__(self, hotkeys, base_chars: dict[int, str] | None = None, *args, **kwargs):
+                self._base_chars = base_chars or {}
+                super().__init__(hotkeys, *args, **kwargs)
+
+            def canonical(self, key):  # pynput's hook for platform normalisation
+                return super().canonical(base_key(key, self._base_chars))
+
+        _LAYOUT_AWARE_CLASS = LayoutAwareGlobalHotKeys
+    return _LAYOUT_AWARE_CLASS
+
+
 class PynputHotkeys:
     name = "pynput"
 
@@ -40,6 +67,8 @@ class PynputHotkeys:
 
     def start(self, mapping: dict[str, Callback]) -> dict[str, str]:
         from pynput import keyboard
+
+        from keyboardmanager.core.backend import darwin_base_chars
 
         self.stop()
         failures: dict[str, str] = {}
@@ -53,7 +82,9 @@ class PynputHotkeys:
                 continue
             valid[spec] = cb
         if valid:
-            self._listener = keyboard.GlobalHotKeys(valid)
+            # the table is rebuilt on every (re)registration, so a keyboard layout
+            # switch is picked up the next time hotkeys are reloaded
+            self._listener = layout_aware_hotkeys_class()(valid, darwin_base_chars())
             self._listener.daemon = True
             self._listener.start()
         return failures

@@ -1,5 +1,4 @@
 import json
-import os
 import sqlite3
 import time
 from datetime import datetime
@@ -9,7 +8,7 @@ import pytest
 from keyboardmanager.core import actions as catalog
 from keyboardmanager.core import io as macro_io
 from keyboardmanager.core.database import Database
-from keyboardmanager.core.models import ActiveWindow, Macro
+from keyboardmanager.core.models import Macro
 from keyboardmanager.core.schedule import Schedule, format_when
 from keyboardmanager.core.scheduler import GRACE_S, Scheduler
 
@@ -305,4 +304,29 @@ def test_export_import_schedule(db):
     result = macro_io.import_from_text(json.dumps(doc), db)
     assert [m.name for m in result.imported] == ["plain", "timed"] and result.scheduled == 1
     assert len(result.skipped) == 1 and "broken" in result.skipped[0]
-    assert db.list_macros()[1].schedule.days == (0,)
+    # a malformed schedule skips that macro instead of aborting the whole import
+    bad = {"format": "keyboardmanager-macros", "version": 1, "macros": [
+        {"name": "odd days", "actions": [], "schedule": {"kind": "weekly", "time": "09:00", "days": [0, "mon"]}},
+        {"name": "fine", "actions": []}]}
+    result = macro_io.import_from_text(json.dumps(bad), db)
+    assert [m.name for m in result.imported] == ["fine"] and "odd days" in result.skipped[0]
+    assert {m.name: m for m in db.list_macros()}["timed"].schedule.days == (0,)
+
+
+@pytest.mark.parametrize("data,problem", [
+    ([], "object"), ({"kind": 5}, "object"), ({"kind": "once", "at": 20300101}, "text"),
+    ({"kind": "weekly", "time": "09:00", "days": [0, "mon"]}, "Monday"),
+    ({"kind": "interval", "minutes": 10_081}, "1 to"), ({"kind": "weekly", "time": "9"}, "HH:MM"),
+    ({"kind": "once", "at": "2030-13-01 00:00"}, "YYYY-MM-DD"),
+])
+def test_invalid_schedule_documents(data, problem):
+    with pytest.raises(ValueError, match=problem):
+        Schedule.from_dict(data)
+
+
+def test_describe_more_cases():
+    assert Schedule("weekly", time="10:00", days=(5, 6)).describe() == "Weekends at 10:00"
+    assert Schedule("interval", minutes=1440).describe() == "Every 1 day"
+    assert Schedule("interval", minutes=60).describe() == "Every 1 hour"
+    assert Schedule().describe() == "Not scheduled" and Schedule().to_dict() == {"kind": "none"}
+    assert Schedule("interval", minutes=5).next_after(0) is None  # computed by the scheduler instead

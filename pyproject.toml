@@ -7,7 +7,12 @@ requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.6",
     "pynput>=1.7.7",
-    "keyboard>=0.13.5",
+    # crashes the interpreter on import under macOS, where it is never used
+    "keyboard>=0.13.5; sys_platform != 'darwin'",
+    # macOS APIs imported directly (active window, permission checks)
+    "pyobjc-framework-Cocoa>=9; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=9; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=9; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
@@ -16,6 +21,7 @@ keyboardmanager = "keyboardmanager.app:main"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pytest-cov>=7.1.0",
 ]
 
 [build-system]
@@ -27,3 +33,6 @@ packages = ["src/keyboardmanager"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "native: uses the real operating-system APIs of the machine running the tests",
+]

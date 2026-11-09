@@ -1,34 +1,16 @@
-import os
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
 import pytest
 
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QMessageBox  # noqa: E402
 
 from keyboardmanager.core import actions as catalog  # noqa: E402
 from keyboardmanager.core.models import Macro  # noqa: E402
 from keyboardmanager.core.service import MacroService  # noqa: E402
-from keyboardmanager.gui.editor import MacroEditor, ROLE_ACTION, ROLE_KIND  # noqa: E402
+from keyboardmanager.gui.editor import MacroEditor  # noqa: E402
 from keyboardmanager.gui.mainwindow import MainWindow  # noqa: E402
 from keyboardmanager.gui.widgets import ActionDialog, KeyCaptureEdit, qt_key_name  # noqa: E402
-
-
-@pytest.fixture(scope="session")
-def qapp():
-    app = QApplication.instance() or QApplication([])
-    yield app
-
-
-@pytest.fixture(autouse=True)
-def no_modal_boxes(monkeypatch):
-    shown = []
-    for name in ("warning", "information", "critical", "question"):
-        monkeypatch.setattr(QMessageBox, name, lambda *a, _n=name, **k: shown.append((_n, a)) or QMessageBox.StandardButton.Yes)
-    return shown
 
 
 def test_qt_key_names():
