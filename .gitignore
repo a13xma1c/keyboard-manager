@@ -8,4 +8,11 @@ build/
 .bob/
 *.db
 .coverage
+# packaged application and build intermediates (tools/package.py)
+*.app/
+*.dmg
+*.iconset/
+/*.spec
+.ruff_cache/
+
 .idea/

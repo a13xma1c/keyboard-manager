@@ -44,3 +44,32 @@ def test_pynput_accepts_generated_hotkey_specs():
 
     for hk in ("ctrl+alt+k", "cmd+f5", "shift+page_up", "ctrl+alt+f12", "alt+space"):
         keyboard.HotKey.parse(keys.to_pynput_hotkey(hk))
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Ctrl+K Ctrl+S", "ctrl+k ctrl+s"),
+    ("  ctrl+alt+k  ", "ctrl+alt+k"),
+    ("ctrl+k  shift+s  x", "ctrl+k shift+s x"),
+])
+def test_normalize_hotkey_sequence(text, expected):
+    assert keys.normalize_hotkey_sequence(text) == expected
+    assert keys.sequence_chords(text) == expected.split()
+
+
+@pytest.mark.parametrize("text", ["", "ctrl+k ctrl", "a b c d", "ctrl+k bogus+x"])
+def test_invalid_hotkey_sequences(text):
+    with pytest.raises(ValueError):
+        keys.normalize_hotkey_sequence(text)
+
+
+@pytest.mark.parametrize("a,b,conflict", [
+    ("ctrl+k", "ctrl+k", True),
+    ("ctrl+k", "ctrl+k ctrl+s", True),          # pressing the prefix fires the short one
+    ("ctrl+k ctrl+s", "ctrl+k", True),
+    ("ctrl+k ctrl+s", "ctrl+k ctrl+s x", True),
+    ("ctrl+k ctrl+a", "ctrl+k ctrl+s", False),  # shared first chord alone is fine
+    ("ctrl+j", "ctrl+k ctrl+s", False),
+])
+def test_sequence_prefix_conflict(a, b, conflict):
+    assert keys.sequence_prefix_conflict(a, b) is conflict
+    assert keys.sequence_prefix_conflict(b, a) is conflict

@@ -104,8 +104,11 @@ def normalize_combo(text: str) -> str:
     return "+".join(combo_keys(text))
 
 
+MAX_SEQUENCE_CHORDS = 3
+
+
 def normalize_hotkey(text: str) -> str:
-    """Canonical hotkey: optional modifiers plus exactly one regular key."""
+    """Canonical single hotkey chord: optional modifiers plus exactly one regular key."""
     keys = combo_keys(text)
     others = [k for k in keys if k not in MODIFIERS]
     if len(others) != 1:
@@ -113,6 +116,32 @@ def normalize_hotkey(text: str) -> str:
     if others[0] in ("plus",) or others[0].startswith("vk:"):
         raise ValueError(f"{others[0]!r} cannot be used in a hotkey")
     return "+".join(keys)
+
+
+def normalize_hotkey_sequence(text: str) -> str:
+    """Canonical hotkey or sequence of chords pressed one after another.
+
+    ``"Ctrl+K Ctrl+S"`` -> ``"ctrl+k ctrl+s"``; chords are separated by spaces.
+    """
+    chords = [normalize_hotkey(part) for part in text.split()]
+    if not chords:
+        raise ValueError("empty hotkey")
+    if len(chords) > MAX_SEQUENCE_CHORDS:
+        raise ValueError(f"a hotkey sequence may have at most {MAX_SEQUENCE_CHORDS} chords")
+    return " ".join(chords)
+
+
+def sequence_chords(hotkey: str) -> list[str]:
+    """The chords of a (possibly single-chord) hotkey sequence, canonical."""
+    return normalize_hotkey_sequence(hotkey).split()
+
+
+def sequence_prefix_conflict(a: str, b: str) -> bool:
+    """True when pressing one hotkey inevitably involves the other: they are equal or
+    one is how the other starts (``ctrl+k`` vs ``ctrl+k ctrl+s``)."""
+    chords_a, chords_b = a.split(), b.split()
+    shorter = min(len(chords_a), len(chords_b))
+    return chords_a[:shorter] == chords_b[:shorter]
 
 
 def to_pynput_hotkey(hotkey: str) -> str:

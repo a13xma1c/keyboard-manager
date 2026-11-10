@@ -25,6 +25,7 @@ class FakeBackend:
     def mouse_click(self, button, count): self.calls.append(("click", button, count))
     def mouse_scroll(self, dx, dy): self.calls.append(("scroll", dx, dy))
     def active_window(self): return self.window
+    def launch(self, target): self.calls.append(("launch", target))
 
 
 class FakeHotkeys:

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Keyboard Manager
+GenericName=Keyboard shortcut and macro manager
+Comment=Create custom keyboard shortcuts, macros and automated sequences
+Exec=KeyboardManager
+Icon=keyboardmanager
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=keyboard;shortcut;macro;automation;hotkey;
+StartupNotify=true

@@ -290,3 +290,19 @@ def test_database_failure_does_not_leave_the_service_busy(db, backend, monkeypat
     svc.run(m)
     assert wait_until(lambda: svc.running_macro is None)
     assert svc.run(m)  # not stuck
+    assert wait_until(lambda: svc.running_macro is None)  # ends before the database is closed
+
+
+def test_shutdown_waits_until_held_keys_are_released(db, backend):
+    """On macOS the process can exit right after shutdown (AppKit calls exit()), so a
+    running macro must have released what it holds by the time shutdown returns."""
+    m = Macro("holding", [catalog.new_action("key_down"), catalog.new_action("delay")])
+    m.actions[0].params["key"] = "shift"
+    m.actions[1].params["ms"] = 10_000
+    svc, hk, _ = make(db, backend)
+    svc.run(db.save_macro(m))
+    assert wait_until(lambda: ("down", "shift") in backend.calls)
+    svc.shutdown()
+    assert ("up", "shift") in backend.calls and svc.running_macro is None
+    assert db.list_history()[0].status == "stopped" and hk.stopped
+    svc.shutdown()  # idempotent: quitting can reach it from several places

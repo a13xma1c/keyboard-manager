@@ -1,0 +1,93 @@
+name: release
+
+# Builds the desktop applications and the Python distribution. Run it by hand, or
+# push a tag like v0.1.0 to also attach everything to a GitHub release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  bundle:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 = Apple silicon, macos-15-intel = Intel: a bundle only runs on the
+        # architecture it was built on, so both are built
+        os: [ubuntu-latest, windows-latest, macos-14, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Qt runtime libraries (Linux)
+        # these end up inside the bundle, so the result runs on machines without them
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libfontconfig1 libdbus-1-3
+
+      - name: Install
+        run: uv sync --locked --group packaging
+
+      - name: Build the application
+        env:
+          # optional: set these as repository secrets to sign the macOS build
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+        run: uv run python tools/package.py
+
+      - name: Check that the built application starts (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a uv run python tools/smoke_bundle.py
+
+      - name: Check that the built application starts
+        if: runner.os != 'Linux'
+        run: uv run python tools/smoke_bundle.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ matrix.os }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.tar.gz
+
+  python-package:
+    name: wheel and sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv build
+      - name: Check the wheel installs and runs
+        run: |
+          uv venv /tmp/check
+          uv pip install --python /tmp/check/bin/python dist/*.whl
+          /tmp/check/bin/keyboardmanager --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distribution
+          path: dist/*
+
+  release:
+    name: attach to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [bundle, python-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*/*
+          generate_release_notes: true

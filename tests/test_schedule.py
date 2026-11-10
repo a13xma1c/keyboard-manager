@@ -233,7 +233,7 @@ def test_service_runs_scheduled_macros(db, backend):
     assert ("type", "hi") in backend.calls
     assert svc.next_run(scoped.id) == ts(2030, 1, 3, 9, 0)  # passed over: filter did not match
 
-    svc.set_schedules_enabled(False)
+    svc.set_autorun_enabled(False)
     assert svc.next_run(m.id) is None and svc.scheduler.upcoming() == []
     svc.shutdown()
 
@@ -287,11 +287,13 @@ def test_database_from_older_version_is_migrated(tmp_path):
     conn.close()
     db = Database(path)
     legacy = db.list_macros()[0]
-    assert legacy.name == "legacy" and legacy.schedule == Schedule()
+    assert legacy.name == "legacy" and legacy.schedule == Schedule() and legacy.event == ""
+    legacy.event = "app_start"
     legacy.schedule = Schedule("interval", minutes=5)
     db.save_macro(legacy)
     db.close()
-    assert Database(path).list_macros()[0].schedule.minutes == 5
+    reopened = Database(path).list_macros()[0]
+    assert reopened.schedule.minutes == 5 and reopened.event == "app_start"
 
 
 def test_export_import_schedule(db):
@@ -330,3 +332,32 @@ def test_describe_more_cases():
     assert Schedule("interval", minutes=60).describe() == "Every 1 hour"
     assert Schedule().describe() == "Not scheduled" and Schedule().to_dict() == {"kind": "none"}
     assert Schedule("interval", minutes=5).next_after(0) is None  # computed by the scheduler instead
+
+
+def test_abbreviation_persists_and_migrates(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE macros (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '', hotkey TEXT NOT NULL DEFAULT '',
+            app_filter TEXT NOT NULL DEFAULT '', window_filter TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1, actions TEXT NOT NULL DEFAULT '[]',
+            schedule TEXT NOT NULL DEFAULT '', event TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        INSERT INTO macros (name, created_at, updated_at) VALUES ('before snippets', 'x', 'x');
+    """)
+    conn.commit()
+    conn.close()
+    db = Database(path)
+    m = db.list_macros()[0]
+    assert m.abbreviation == ""
+    m.abbreviation = ";hi"
+    db.save_macro(m)
+    assert Database(path).list_macros()[0].abbreviation == ";hi"
+    doc = macro_io.export_to_dict([m])
+    assert doc["macros"][0]["abbreviation"] == ";hi"
+    assert Macro.from_dict(doc["macros"][0]).abbreviation == ";hi"
+    with pytest.raises(ValueError):
+        Macro.from_dict({"name": "x", "abbreviation": "has space"})

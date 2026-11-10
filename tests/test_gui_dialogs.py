@@ -30,7 +30,10 @@ def test_capture_hotkey_with_modifiers(qapp, pc_keyboard):
     QTest.keyPress(w.button, Qt.Key.Key_Control, Qt.KeyboardModifier.ControlModifier)
     assert w.button.text() == "ctrl+..."
     QTest.keyClick(w.button, Qt.Key.Key_F5, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
-    assert w.text() == "ctrl+shift+f5" and not w.button.isChecked()
+    QTest.keyRelease(w.button, Qt.Key.Key_Control)  # or Qt believes Ctrl stays held for later tests
+    assert w.text() == "ctrl+shift+f5" and w.button.isChecked()  # a sequence may continue
+    w.button.setChecked(False)  # click again to finish
+    assert w.text() == "ctrl+shift+f5"
 
 
 def test_capture_single_key_and_lone_modifier(qapp, pc_keyboard):
@@ -71,7 +74,9 @@ def test_action_dialog_accepts_defaults_or_explains(qapp, action_type, no_modal_
     action = catalog.new_action(action_type)
     dlg = ActionDialog(action)
     dlg._accept()
-    if action_type in ("type_text", "if"):  # need input from the user
+    needs_input = ("type_text", "if", "while", "paste_text", "run_macro", "wait_for_window", "launch",
+                   "wait_for_image", "click_image", "focus_window")
+    if action_type in needs_input:  # need input from the user
         assert no_modal_boxes and dlg.result() != dlg.DialogCode.Accepted
     else:
         assert not no_modal_boxes and dlg.result() == dlg.DialogCode.Accepted
@@ -125,6 +130,8 @@ class _FakeRecorder:
         self.on_stopped, self.on_event = on_stopped, on_event
         self.started = False
         self.fail = False
+        self.paused = False
+        self.on_pause_changed = None
 
     def start(self):
         if self.fail:
@@ -154,7 +161,10 @@ def test_recording_session_hides_windows_and_restores_them(session):
     s.start()
     assert not window.isVisible() and s._recorder.started
     s._recorder.on_event(3)
-    assert "3 events" in s._overlay.text() and "F9" in s._overlay.text()
+    assert "3 events" in s._overlay.text() and "F9 stops" in s._overlay.text() and "F8 pauses" in s._overlay.text()
+    s._recorder.paused = True
+    s._recorder.on_pause_changed(True)
+    assert s._overlay.text() == "Paused (3 events) - F8 resumes, F9 stops"
     s._recorder.on_stopped()
     assert window.isVisible() and not s._overlay.isVisible()
     assert [a.params["text"] for a in results[0]] == ["rec"]
@@ -201,3 +211,34 @@ def test_history_formatting():
     assert format_duration(999) == "999 ms" and format_duration(61_000) == "61.0 s"
     assert format_time("garbage") == "garbage"
     assert format_time("2030-01-02T03:04:05+00:00").startswith("2030-01-0")
+
+
+def test_capture_a_hotkey_sequence_chord_by_chord(qapp, pc_keyboard):
+    from keyboardmanager.gui.widgets import KeyCaptureEdit
+
+    w = KeyCaptureEdit("hotkey")
+    w.show()
+    w.button.setChecked(True)
+    QTest.keyClick(w.button, Qt.Key.Key_K, Qt.KeyboardModifier.ControlModifier)
+    assert w.button.isChecked() and "next chord" in w.button.text()
+    QTest.keyClick(w.button, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
+    w.button.setChecked(False)
+    assert w.text() == "ctrl+k ctrl+s" and w.normalized() == "ctrl+k ctrl+s"
+    # capturing again starts over instead of appending
+    w.button.setChecked(True)
+    QTest.keyClick(w.button, Qt.Key.Key_F2)
+    w.button.setChecked(False)
+    assert w.text() == "f2"
+
+
+def test_capture_stops_at_the_sequence_limit(qapp, pc_keyboard):
+    from keyboardmanager.core import keys
+    from keyboardmanager.gui.widgets import KeyCaptureEdit
+
+    w = KeyCaptureEdit("hotkey")
+    w.show()
+    w.button.setChecked(True)
+    for key in (Qt.Key.Key_A, Qt.Key.Key_B, Qt.Key.Key_C, Qt.Key.Key_D):
+        QTest.keyClick(w.button, key, Qt.KeyboardModifier.ControlModifier)
+    assert not w.button.isChecked()  # finished by itself at the limit
+    assert w.text() == "ctrl+a ctrl+b ctrl+c" and len(w.text().split()) == keys.MAX_SEQUENCE_CHORDS

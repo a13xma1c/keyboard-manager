@@ -15,6 +15,8 @@ class _AppProxy:
 
     def __init__(self, real, code=0):
         self.real, self.code, self.name = real, code, None
+        self.quit_handlers = []
+        self.aboutToQuit = type("Signal", (), {"connect": lambda _, fn: self.quit_handlers.append(fn)})()
 
     def __call__(self, argv):
         self.argv = argv
@@ -58,6 +60,8 @@ def test_main_starts_and_shuts_down(started):
     assert started["proxy"].name == "Keyboard Manager" and started["proxy"].quit_on_close is False
     assert started["proxy"].argv[1:] == ["-style", "fusion"]  # unknown args go to Qt
     assert started["hotkeys"].stopped  # service.shutdown() ran
+    # macOS may end the process inside exec(), so cleanup must also hang off aboutToQuit
+    assert started["proxy"].quit_handlers == [started["service"].shutdown]
     assert "ctrl+alt+f12" in started["hotkeys"].mapping
     started["window"].close()
 

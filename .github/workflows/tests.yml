@@ -42,6 +42,7 @@ jobs:
         if: runner.os != 'Linux'
         run: uv run pytest -ra --cov=keyboardmanager --cov-report=term-missing
 
-      - name: macOS-specific tests ran natively
+      # fail loudly if the native macOS tests (real APIs, real app) were skipped
+      - name: Native macOS tests
         if: runner.os == 'macOS'
-        run: uv run pytest -ra -m native tests/test_macos.py
+        run: uv run pytest -ra -m native tests/test_macos.py tests/test_native_smoke.py

@@ -9,6 +9,7 @@ from pathlib import Path
 from keyboardmanager.core import actions as action_catalog
 from keyboardmanager.core import keys
 from keyboardmanager.core.database import Database
+from keyboardmanager.core.expander import abbreviations_conflict
 from keyboardmanager.core.models import Macro
 
 FORMAT_NAME = "keyboardmanager-macros"
@@ -25,7 +26,8 @@ class ImportResult:
     skipped: list[str] = field(default_factory=list)  # human readable reasons
     renamed: int = 0
     hotkeys_cleared: int = 0
-    scheduled: int = 0  # imported macros that will run by themselves
+    abbreviations_cleared: int = 0
+    scheduled: int = 0  # imported macros that will run by themselves (schedule or event)
 
 
 def export_to_dict(macros: list[Macro]) -> dict:
@@ -77,7 +79,7 @@ def import_from_text(text: str, db: Database) -> ImportResult:
             if problems:
                 raise ValueError(problems[0])
             if macro.hotkey.strip():
-                macro.hotkey = keys.normalize_hotkey(macro.hotkey)
+                macro.hotkey = keys.normalize_hotkey_sequence(macro.hotkey)
             else:
                 macro.hotkey = ""
         except ValueError as exc:
@@ -89,14 +91,22 @@ def import_from_text(text: str, db: Database) -> ImportResult:
             result.renamed += 1
             macro.name = unique
         if macro.hotkey and any(
-            o.hotkey == macro.hotkey and scopes_conflict(o, macro) for o in existing
+            o.hotkey and keys.sequence_prefix_conflict(o.hotkey, macro.hotkey) and scopes_conflict(o, macro)
+            for o in existing
         ):
             macro.hotkey = ""
             result.hotkeys_cleared += 1
+        if macro.abbreviation and any(
+            o.abbreviation and abbreviations_conflict(o.abbreviation, macro.abbreviation)
+            and scopes_conflict(o, macro)
+            for o in existing
+        ):
+            macro.abbreviation = ""
+            result.abbreviations_cleared += 1
         db.save_macro(macro)
         existing.append(macro)
         result.imported.append(macro)
-        if macro.schedule.active and macro.enabled:
+        if (macro.schedule.active or macro.event) and macro.enabled:
             result.scheduled += 1
     return result
 
@@ -113,9 +123,16 @@ def scopes_conflict(a: Macro, b: Macro) -> bool:
     """Would ``a`` and ``b`` compete for the same hotkey press?
 
     A global macro and an application-specific one may share a hotkey (the specific
-    one wins while its application is focused); two global macros, or two macros with
-    identical filters, may not.
+    one wins while its application is focused), as may macros on different keymap
+    layers (the active layer's macro wins) or restricted to profiles that are never
+    active together. Two global macros, or two with identical filters, may not.
     """
+    if a.layer.strip().lower() != b.layer.strip().lower():
+        return False
+    if a.profiles and b.profiles and not (
+        {p.lower() for p in a.profiles} & {p.lower() for p in b.profiles}
+    ):
+        return False  # under "All profiles" both are active: the first by name wins
     return (a.app_filter.strip().lower(), a.window_filter.strip().lower()) == (
         b.app_filter.strip().lower(),
         b.window_filter.strip().lower(),

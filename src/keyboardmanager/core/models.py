@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from keyboardmanager.core.limits import Limits
 from keyboardmanager.core.schedule import Schedule
 
 
@@ -65,6 +66,9 @@ class Action:
         )
 
 
+WHEN_BUSY = ("skip", "queue")
+
+
 def _csv(text: str) -> list[str]:
     return [p.strip().lower() for p in text.split(",") if p.strip()]
 
@@ -79,6 +83,18 @@ class Macro:
     window_filter: str = ""  # window title substring
     enabled: bool = True
     schedule: Schedule = field(default_factory=Schedule)
+    event: str = ""  # run on an event; see core.events.EVENTS
+    abbreviation: str = ""  # text expansion: typing it runs the macro; see core.expander
+    folder: str = ""  # "" = top level; nested folders are "Work/Email"
+    tags: list[str] = field(default_factory=list)
+    favorite: bool = False
+    speed: float = 1.0  # playback speed of delays and typing (2.0 = twice as fast)
+    limits: Limits = field(default_factory=Limits)
+    when_busy: str = "skip"  # another macro is running: "skip" this run, or "queue" it
+    profiles: list[str] = field(default_factory=list)  # restrict to these profiles ([] = all)
+    layer: str = ""  # hotkey / abbreviation only work while this layer is active ("" = base)
+    uid: str = ""    # stable id across devices (sync, team libraries); set when first saved
+    source: str = ""  # "" = my own macro; "team:<id>" = a read-only copy from a team library
     id: int | None = None
     created_at: str = ""
     updated_at: str = ""
@@ -121,6 +137,16 @@ class Macro:
             "window_filter": self.window_filter,
             "enabled": self.enabled,
             **({"schedule": self.schedule.to_dict()} if self.schedule.active else {}),
+            **({"event": self.event} if self.event else {}),
+            **({"abbreviation": self.abbreviation} if self.abbreviation else {}),
+            **({"folder": self.folder} if self.folder else {}),
+            **({"tags": list(self.tags)} if self.tags else {}),
+            **({"favorite": True} if self.favorite else {}),
+            **({"speed": self.speed} if self.speed != 1.0 else {}),
+            **({"limits": self.limits.to_dict()} if self.limits.active else {}),
+            **({"when_busy": self.when_busy} if self.when_busy != "skip" else {}),
+            **({"profiles": list(self.profiles)} if self.profiles else {}),
+            **({"layer": self.layer} if self.layer else {}),
             "actions": [a.to_dict() for a in self.actions],
         }
 
@@ -134,12 +160,15 @@ class Macro:
         actions = data.get("actions", [])
         if not isinstance(actions, list):
             raise ValueError("'actions' must be a list")
-        for key in ("description", "hotkey", "app_filter", "window_filter"):
+        for key in ("description", "hotkey", "app_filter", "window_filter", "event", "abbreviation", "folder"):
             if not isinstance(data.get(key, ""), str):
                 raise ValueError(f"'{key}' must be text")
-        if not isinstance(data.get("enabled", True), bool):
-            raise ValueError("'enabled' must be true or false")
-        return cls(
+        for key in ("enabled", "favorite"):
+            if not isinstance(data.get(key, key == "enabled"), bool):
+                raise ValueError(f"'{key}' must be true or false")
+        if not isinstance(data.get("tags", []), list):
+            raise ValueError("'tags' must be a list")
+        macro = cls(
             name=name,
             description=data.get("description", ""),
             hotkey=data.get("hotkey", ""),
@@ -147,8 +176,34 @@ class Macro:
             window_filter=data.get("window_filter", ""),
             enabled=data.get("enabled", True),
             schedule=Schedule.from_dict(data.get("schedule")),
+            event=data.get("event", ""),
             actions=[Action.from_dict(a) for a in actions],
         )
+        from keyboardmanager.core.events import validate_event
+        from keyboardmanager.core.expander import normalize_abbreviation
+
+        from keyboardmanager.core.organize import normalize_folder, normalize_tags, validate_speed
+
+        validate_event(macro.event, macro)
+        macro.abbreviation = normalize_abbreviation(data.get("abbreviation", ""))
+        macro.folder = normalize_folder(data.get("folder", ""))
+        macro.tags = normalize_tags(data.get("tags", []))
+        macro.favorite = data.get("favorite", False)
+        macro.speed = validate_speed(data.get("speed", 1.0))
+        macro.limits = Limits.from_dict(data.get("limits"))
+        macro.when_busy = data.get("when_busy", "skip")
+        if macro.when_busy not in WHEN_BUSY:
+            raise ValueError(f"'when_busy' must be one of {', '.join(WHEN_BUSY)}")
+        from keyboardmanager.core.profiles import normalize_profiles
+
+        if not isinstance(data.get("profiles", []), list):
+            raise ValueError("'profiles' must be a list")
+        macro.profiles = normalize_profiles(data.get("profiles", []))
+        layer = data.get("layer", "")
+        if not isinstance(layer, str):
+            raise ValueError("'layer' must be text")
+        macro.layer = " ".join(layer.split())
+        return macro
 
 
 @dataclass

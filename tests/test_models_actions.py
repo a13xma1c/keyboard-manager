@@ -53,6 +53,8 @@ def test_validation_rules():
 def test_every_spec_has_valid_defaults_and_description():
     for t in catalog.SPECS:
         a = catalog.new_action(t)
-        if t not in ("type_text", "if"):  # these need a value from the user
-            assert catalog.validate_action(a) == [], t
+        needs_input = ("type_text", "if", "while", "paste_text", "run_macro", "wait_for_window", "launch",
+                       "wait_for_image", "click_image", "focus_window")
+        if t not in needs_input:  # these need a value from the user
+            assert catalog.validate_action(a, in_loop=True) == [], t  # parameters only
         assert catalog.describe(a)

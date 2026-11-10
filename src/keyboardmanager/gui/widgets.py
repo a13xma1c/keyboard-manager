@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import QDateTime, QEvent, Qt, QTime, QTimer, Signal
-from PySide6.QtGui import QCursor, QKeyEvent
+from PySide6.QtGui import QCursor, QFontDatabase, QKeyEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QStackedWidget,
@@ -39,6 +40,7 @@ from keyboardmanager.core.schedule import (
     parse_at,
     parse_clock,
 )
+from keyboardmanager.gui.theme import set_tone
 
 _K = Qt.Key
 _IS_MAC = sys.platform == "darwin"
@@ -102,8 +104,10 @@ def qt_modifier_names(event: QKeyEvent) -> list[str]:
 class KeyCaptureEdit(QWidget):
     """Text field plus a *Capture* button that records the next key combination.
 
-    ``mode``: ``hotkey`` (modifiers + one key), ``combo`` (same, any text accepted)
-    or ``key`` (a single key, modifiers allowed on their own).
+    ``mode``: ``hotkey`` (one or more chords pressed in turn, e.g. ``ctrl+k ctrl+s``),
+    ``combo`` (modifiers + one key, any text accepted) or ``key`` (a single key,
+    modifiers allowed on their own). In hotkey mode, capturing keeps going so a
+    sequence can be typed chord by chord; click the button again to finish.
     """
 
     changed = Signal()
@@ -113,8 +117,9 @@ class KeyCaptureEdit(QWidget):
         self.mode = mode
         self._capturing = False
         self._pending: str | None = None
+        self._chords: list[str] = []
         self.edit = QLineEdit()
-        self.edit.setPlaceholderText("e.g. ctrl+alt+k" if mode != "key" else "e.g. shift")
+        self.edit.setPlaceholderText("e.g. ctrl+alt+k or ctrl+k ctrl+s" if mode != "key" else "e.g. shift")
         self.edit.textChanged.connect(lambda _t: self.changed.emit())
         self.button = QPushButton("Capture")
         self.button.setCheckable(True)
@@ -137,7 +142,7 @@ class KeyCaptureEdit(QWidget):
         """Canonical form; raises ``ValueError`` when the text is not a valid key spec."""
         text = self.text()
         if self.mode == "hotkey":
-            return keys.normalize_hotkey(text)
+            return keys.normalize_hotkey_sequence(text)
         if self.mode == "key":
             return keys.normalize_key(text)
         return keys.normalize_combo(text)
@@ -146,6 +151,7 @@ class KeyCaptureEdit(QWidget):
     def _toggle(self, on: bool) -> None:
         self._capturing = on
         self._pending = None
+        self._chords = []
         self.button.setText("Press keys..." if on else "Capture")
         if on:
             self.button.setFocus()
@@ -181,17 +187,25 @@ class KeyCaptureEdit(QWidget):
             self.button.setText("+".join(m for m in keys.MODIFIERS if m in held) + "+...")
             return
         self._pending = None
-        if self.mode == "key":
-            self._finish(name)
+        chord = "+".join([*qt_modifier_names(event), name]) if self.mode != "key" else name
+        if self.mode != "hotkey":
+            self._finish(chord)
+            return
+        # hotkey sequences: keep capturing so more chords can follow
+        self._chords.append(chord)
+        self.edit.setText(" ".join(self._chords))
+        if len(self._chords) >= keys.MAX_SEQUENCE_CHORDS:
+            self.button.setChecked(False)
         else:
-            self._finish("+".join([*qt_modifier_names(event), name]))
+            self.button.setText("... next chord, or click to finish")
 
 
 class ActionDialog(QDialog):
     """Edit the parameters of a single action; the form is generated from its spec."""
 
-    def __init__(self, action: Action, parent: QWidget | None = None) -> None:
+    def __init__(self, action: Action, parent: QWidget | None = None, macro_names: list[str] | None = None) -> None:
         super().__init__(parent)
+        self._macro_names = macro_names or []
         self.spec: ActionSpec = catalog.spec_for(action.type)
         self.setWindowTitle(self.spec.label)
         self.setMinimumWidth(440)
@@ -214,6 +228,16 @@ class ActionDialog(QDialog):
             self._rows[f.name] = (label, widget)
             if f.hint:
                 widget.setToolTip(f.hint)
+        if any(f.kind == "code" for f in self.spec.fields) or self.spec.type in ("if", "while", "set_variable"):
+            from keyboardmanager.core.script import COMMAND_HELP, FUNCTION_HELP
+
+            reference = QLabel(("<b>Commands:</b> " + COMMAND_HELP + "<br>" if self.spec.type == "script" else "")
+                               + "<b>Functions:</b> " + FUNCTION_HELP)
+            reference.setWordWrap(True)
+            set_tone(reference, "secondary")
+            reference.setTextFormat(Qt.TextFormat.RichText)
+            self.form.addRow("", reference)
+            self._reference = reference
         if {"x", "y"} <= self._widgets.keys():
             pick = QPushButton("Pick position (3 s countdown)")
             pick.clicked.connect(self._pick_position)
@@ -228,6 +252,13 @@ class ActionDialog(QDialog):
 
     # --------------------------------------------------------------- widgets
     def _make_widget(self, f: Field, value) -> QWidget:
+        if f.kind == "image":
+            from keyboardmanager.gui.capture import ImagePathEdit
+
+            w = ImagePathEdit()
+            w.setText(str(value))
+            w.changed.connect(self._update_visibility)
+            return w
         if f.kind in ("combo", "key"):
             w = KeyCaptureEdit("combo" if f.kind == "combo" else "key")
             w.setText(str(value))
@@ -255,13 +286,31 @@ class ActionDialog(QDialog):
             w.setCurrentText(str(value))
             w.currentTextChanged.connect(self._update_visibility)
             return w
+        if f.kind == "macro":  # pick an existing macro (or type a name)
+            w = QComboBox()
+            w.setEditable(True)
+            w.addItems(self._macro_names)
+            w.setCurrentText(str(value))
+            return w
+        if f.kind in ("multiline", "code"):
+            w = QPlainTextEdit(str(value))
+            w.setFixedHeight(90 if f.kind == "multiline" else 220)
+            if f.kind == "code":  # scripts: fixed-width font, tab = 4 spaces
+                font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+                w.setFont(font)
+                w.setTabStopDistance(4 * w.fontMetrics().horizontalAdvance(" "))
+                w.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            w.textChanged.connect(self._update_visibility)
+            return w
         w = QLineEdit(str(value))
         w.textChanged.connect(self._update_visibility)
         return w
 
     @staticmethod
     def _read(f: Field, w: QWidget):
-        if isinstance(w, KeyCaptureEdit):
+        from keyboardmanager.gui.capture import ImagePathEdit
+
+        if isinstance(w, (KeyCaptureEdit, ImagePathEdit)):
             return w.text()
         if isinstance(w, QSpinBox):
             return w.value()
@@ -271,6 +320,8 @@ class ActionDialog(QDialog):
             return w.isChecked()
         if isinstance(w, QComboBox):
             return w.currentText()
+        if isinstance(w, QPlainTextEdit):
+            return w.toPlainText()
         return w.text()  # type: ignore[attr-defined]
 
     def values(self) -> dict:
@@ -307,7 +358,8 @@ class ActionDialog(QDialog):
     # --------------------------------------------------------------- result
     def _accept(self) -> None:
         candidate = Action(self._action.type, self.values())
-        problems = catalog.validate_action(candidate)
+        # parameters only: where the step sits (e.g. Break inside a loop) is checked on save
+        problems = catalog.validate_action(candidate, in_loop=True)
         if problems:
             QMessageBox.warning(self, "Invalid action", "\n".join(p.split(": ", 1)[-1] for p in problems))
             return

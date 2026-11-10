@@ -37,6 +37,9 @@ class RecordOptions:
     record_delays: bool = True
     min_delay_ms: int = 50
     stop_key: str = "f9"
+    pause_key: str = "f8"  # pauses / resumes capturing; the paused time is not recorded
+    record_keyboard: bool = True
+    record_clicks: bool = True  # mouse buttons and the wheel
 
 
 class _Builder:
@@ -205,6 +208,46 @@ class _Builder:
         self.last_scroll = (t, a)
 
 
+@dataclass
+class RefineOptions:
+    """Clean-ups offered after recording (see ``refine``)."""
+
+    max_pause_ms: int = 0       # shorten longer pauses to this (0 = keep them)
+    remove_pauses: bool = False
+    remove_moves: bool = False
+    join_lines: bool = False    # "text", Enter, "more text" -> one multi-line text
+
+
+def refine(actions: list[Action], options: RefineOptions) -> list[Action]:
+    """Return a cleaned-up copy of recorded ``actions`` (the originals are untouched)."""
+    out = [a.clone() for a in actions]
+    if options.remove_moves:
+        out = [a for a in out if a.type != "mouse_move"]
+    if options.remove_pauses:
+        out = [a for a in out if a.type != "delay"]
+    elif options.max_pause_ms > 0:
+        for a in out:
+            if a.type == "delay" and a.params.get("ms", 0) > options.max_pause_ms:
+                a.params["ms"] = options.max_pause_ms
+    if options.join_lines:
+        joined: list[Action] = []
+        for a in out:
+            is_enter = a.type == "key_press" and a.params.get("keys") == "enter"
+            if is_enter or a.type == "type_text":
+                # the pauses between typing and Enter are part of typing the block
+                pauses = 0
+                while pauses < len(joined) and joined[-1 - pauses].type == "delay":
+                    pauses += 1
+                text = joined[-1 - pauses] if pauses < len(joined) else None
+                if text is not None and text.type == "type_text":
+                    del joined[len(joined) - pauses:]
+                    text.params["text"] += "\n" if is_enter else a.params.get("text", "")
+                    continue
+            joined.append(a)
+        out = joined
+    return out
+
+
 def build_actions(events: list[Event], options: RecordOptions | None = None) -> list[Action]:
     b = _Builder(options or RecordOptions())
     for t, kind, data in events:
@@ -256,37 +299,61 @@ class Recorder:
         self._down_names: dict[object, str] = {}
         self._base_chars: dict[int, str] = {}
         self._stop_key_down = False
+        self._pause_key_down = False
+        self._paused_since: float | None = None
+        self._paused_total = 0.0
         self._active = False
+        self.on_pause_changed: Callable[[bool], None] | None = None
 
     @property
     def active(self) -> bool:
         return self._active
 
+    @property
+    def paused(self) -> bool:
+        return self._paused_since is not None
+
+    def toggle_pause(self) -> None:
+        """Pause or resume capturing. The paused time is left out of the recording's
+        clock, so resuming does not insert a long delay."""
+        now = time.monotonic()
+        with self._lock:
+            if self._paused_since is None:
+                self._paused_since = now
+            else:
+                self._paused_total += now - self._paused_since
+                self._paused_since = None
+        if self.on_pause_changed:
+            self.on_pause_changed(self.paused)
+
     def start(self) -> None:
         from pynput import keyboard, mouse
 
-        from keyboardmanager.core.backend import darwin_base_chars
+        from keyboardmanager.core.backend import darwin_base_chars, safe_listener, start_listener
 
         if self._active:
             return
         self._events = []
         self._held, self._down_names = {}, {}
+        self._paused_since, self._paused_total = None, 0.0
         self._base_chars = darwin_base_chars()  # on the calling (GUI) thread, see its docs
         self._active = True
-        self._kb = keyboard.Listener(on_press=self._press, on_release=self._release)
-        self._mouse = mouse.Listener(
+        self._kb = safe_listener(keyboard.Listener)(on_press=self._press, on_release=self._release)
+        self._mouse = safe_listener(mouse.Listener)(
             on_move=self._move, on_click=self._click, on_scroll=self._scroll
         )
-        self._kb.start()
-        self._mouse.start()
+        start_listener(self._kb)
+        start_listener(self._mouse)
 
     def stop(self) -> list[Action]:
         """Stop listening and return the recorded actions."""
+        from keyboardmanager.core.backend import stop_listener
+
         if self._active:
             self._active = False
             for listener in (self._kb, self._mouse):
                 if listener is not None:
-                    listener.stop()
+                    stop_listener(listener)
         with self._lock:
             events = list(self._events)
         return build_actions(events, self.options)
@@ -295,8 +362,14 @@ class Recorder:
     def _add(self, kind: str, data: object) -> None:
         if not self._active:
             return
+        if kind in ("key_down", "key_up") and not self.options.record_keyboard:
+            return
+        if kind in ("click", "scroll") and not self.options.record_clicks:
+            return
         with self._lock:
-            self._events.append((time.monotonic(), kind, data))
+            if self._paused_since is not None:
+                return
+            self._events.append((time.monotonic() - self._paused_total, kind, data))
             n = len(self._events)
         if self._on_event:
             self._on_event(n)
@@ -317,7 +390,9 @@ class Recorder:
         vk = getattr(key, "vk", None)
         return ("vk", vk) if vk is not None else key
 
-    def _press(self, key) -> None:
+    def _press(self, key, injected: bool = False) -> None:
+        if injected:  # sent by Keyboard Manager itself (a macro, a snippet, a remap)
+            return
         name = self._name(key)
         if name is None:
             return
@@ -327,6 +402,11 @@ class Recorder:
                 self._stop_key_down = True
                 self._active_stop()
             return
+        if name == self.options.pause_key:
+            if not self._pause_key_down:
+                self._pause_key_down = True
+                self.toggle_pause()
+            return
         if name in ("ctrl", "alt", "cmd"):
             self._held[self._ident(key)] = name
         char = getattr(key, "char", None)
@@ -335,12 +415,17 @@ class Recorder:
         else:
             self._add("key_down", name)
 
-    def _release(self, key) -> None:
+    def _release(self, key, injected: bool = False) -> None:
+        if injected:
+            return
         name = self._down_names.pop(self._ident(key), None) or self._name(key)
         if name is None:
             return
         if name == self.options.stop_key:
             self._stop_key_down = False
+            return
+        if name == self.options.pause_key:
+            self._pause_key_down = False
             return
         self._held.pop(self._ident(key), None)
         self._add("key_up", name)
@@ -349,11 +434,14 @@ class Recorder:
         if self._on_stopped:
             self._on_stopped()
 
-    def _move(self, x, y) -> None:
-        self._add("move", (int(x), int(y)))
+    def _move(self, x, y, injected: bool = False) -> None:
+        if not injected:
+            self._add("move", (int(x), int(y)))
 
-    def _click(self, x, y, button, pressed) -> None:
-        self._add("click", (int(x), int(y), button.name, bool(pressed)))
+    def _click(self, x, y, button, pressed, injected: bool = False) -> None:
+        if not injected:
+            self._add("click", (int(x), int(y), button.name, bool(pressed)))
 
-    def _scroll(self, x, y, dx, dy) -> None:
-        self._add("scroll", (int(x), int(y), int(dx), int(dy)))
+    def _scroll(self, x, y, dx, dy, injected: bool = False) -> None:
+        if not injected:
+            self._add("scroll", (int(x), int(y), int(dx), int(dy)))

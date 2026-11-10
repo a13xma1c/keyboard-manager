@@ -237,8 +237,8 @@ def test_main_window_schedule(qapp, db, backend):
     assert saved.schedule == Schedule("weekly", time="09:00", days=(0,))
     assert "next run" in win.statusBar().currentMessage()
     assert ed.schedule_status.text().startswith("Next run: ")
-    assert "(scheduled)" in win.list.item(0).text()
-    assert 'Schedules: 1, next "New macro"' in win.status_label.text()
+    assert "(scheduled)" in win.list.macro_items()[0].text(0)
+    assert '1 scheduled, next "New macro"' in win.status_label.text()
 
     # a time that has already passed is accepted but clearly reported
     ed.schedule_edit.set_schedule(Schedule("once", at="2001-01-01 00:00"))
@@ -254,10 +254,10 @@ def test_main_window_schedule(qapp, db, backend):
 
     ed.schedule_edit.set_schedule(Schedule("interval", minutes=5))
     assert win.save_current()
-    win.schedules_action.setChecked(False)
-    assert not service.schedules_enabled and "Schedules: off" in win.status_label.text()
-    assert ed.schedule_status.text() == "Schedules are switched off"
-    win.schedules_action.setChecked(True)
+    win.autorun_action.setChecked(False)
+    assert not service.autorun_enabled and "Auto-run: off" in win.status_label.text()
+    assert ed.schedule_status.text() == "Auto-run is switched off"
+    win.autorun_action.setChecked(True)
     ed.enabled_check.setChecked(False)
     assert win.save_current()
     assert ed.schedule_status.text() == "Macro disabled"

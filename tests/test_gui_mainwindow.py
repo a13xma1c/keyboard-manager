@@ -51,13 +51,13 @@ def test_list_shows_hotkeys_schedules_and_disabled_and_filters(win, db):
     db.save_macro(typing_macro("Alpha", hotkey="ctrl+alt+a"))
     db.save_macro(typing_macro("Beta", enabled=False, schedule=Schedule("interval", minutes=5)))
     win._reload_macros()
-    texts = [win.list.item(i).text() for i in range(win.list.count())]
+    texts = [i.text(0) for i in win.list.macro_items()]
     assert texts == ["Alpha  [ctrl+alt+a]", "Beta  (scheduled)  (disabled)"]
-    assert "Schedule: Every 5 min" in win.list.item(1).toolTip()
+    assert "Schedule: Every 5 min" in win.list.macro_items()[1].toolTip(0)
     win.search.setText("alt+a")  # search matches names and hotkeys
-    assert win.list.count() == 1 and win.list.item(0).text().startswith("Alpha")
+    assert len(win.list.macro_items()) == 1 and win.list.macro_items()[0].text(0).startswith("Alpha")
     win.search.setText("nothing")
-    assert win.list.count() == 0
+    assert len(win.list.macro_items()) == 0
 
 
 def test_selection_and_unsaved_changes(win, db, monkeypatch):
@@ -67,10 +67,10 @@ def test_selection_and_unsaved_changes(win, db, monkeypatch):
     assert win.editor.name_edit.text() == "A" and win.run_btn.isEnabled()
     win.editor.name_edit.setText("A edited")
     answer(monkeypatch, QMessageBox.StandardButton.Cancel)
-    win.list.setCurrentRow(1)  # switching away is refused: the edit is kept
+    win.list.setCurrentItem(win.list.macro_items()[1])  # switching away is refused: the edit is kept
     assert win._current_id == a.id and win.editor.name_edit.text() == "A edited"
     answer(monkeypatch, QMessageBox.StandardButton.Discard)
-    win.list.setCurrentRow(1)
+    win.list.setCurrentItem(win.list.macro_items()[1])
     assert win._current_id == b.id and win.editor.name_edit.text() == "B"
     win._select(None)
     assert not win.editor.isEnabled() and not win.run_btn.isEnabled() and win.export_btn.isEnabled()
@@ -132,10 +132,13 @@ def test_run_selected_and_busy(win, db, backend, qapp, monkeypatch, no_modal_box
     win._run_selected()
     assert pump(qapp, lambda: '"Greet": success' in win.statusBar().currentMessage())
     assert ("type", "hello") in backend.calls and not win.stop_action.isEnabled()
-    # a second run while one is active is refused
-    monkeypatch.setattr(win.service, "run", lambda *a, **k: False)
+    # a second run while one is active is not started at once: the user may queue it
+    calls = []
+    monkeypatch.setattr(win.service, "run", lambda *a, **k: calls.append(k.get("queue")) or k.get("queue"))
     win._run_selected()
-    assert no_modal_boxes[-1][0] == "information"
+    assert no_modal_boxes[-1][0] == "question" and "Queue" in no_modal_boxes[-1][1][2]
+    assert calls == [False, True]
+    assert "Queued" in win.statusBar().currentMessage()
 
 
 def test_test_run_uses_the_unsaved_editor_content(win, db, backend, qapp):
@@ -202,8 +205,8 @@ def test_toggles(win, hk, db):
     assert "ctrl+alt+u" not in hk.mapping and "Global hotkeys: off" in win.status_label.text()
     win.hotkeys_action.setChecked(True)
     assert "ctrl+alt+u" in hk.mapping
-    win.schedules_action.setChecked(False)
-    assert "Schedules: off" in win.status_label.text()
+    win.autorun_action.setChecked(False)
+    assert "Auto-run: off" in win.status_label.text()
 
 
 # ----------------------------------------------------------- tray & quitting
@@ -317,9 +320,145 @@ def test_import_results_and_errors(win, db, tmp_path, monkeypatch, no_modal_boxe
     win._import()
     kind, args = no_modal_boxes[-1]
     assert kind == "information"
-    assert "Imported 1 macro(s)" in args[2] and "will run automatically" in args[2] and "Broken" in args[2]
+    assert "Imported 1 macro(s)" in args[2] and "will run by themselves" in args[2] and "Broken" in args[2]
     assert win.editor.name_edit.text() == "Timed"
 
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: ("", ""))  # cancelled
     win._import()
     assert len(db.list_macros()) == 1
+
+
+def test_quit_while_hidden_in_the_tray_cleans_up(tray_win, db, backend):
+    """Cmd+Q / Dock > Quit / logout with the window hidden: no closeEvent happens and on
+    macOS exec() never returns, so the Quit event itself must shut everything down."""
+    win, _, _ = tray_win
+    m = Macro("hold", [catalog.new_action("key_down"), catalog.new_action("delay")])
+    m.actions[0].params["key"] = "alt"
+    m.actions[1].params["ms"] = 10_000
+    win.service.run(db.save_macro(m))
+    assert wait_until(lambda: ("down", "alt") in backend.calls)
+    win.close()  # hidden in the tray, still running
+    event = QEvent(QEvent.Type.Quit)
+    QApplication.sendEvent(QApplication.instance(), event)
+    assert win._quitting and win.service.hotkeys.stopped
+    assert ("up", "alt") in backend.calls and win.service.running_macro is None
+
+
+# ------------------------------------------- quitting on macOS (AppKit exit())
+@pytest.fixture
+def filters_removed(monkeypatch):
+    removed = []
+    original = QApplication.removeEventFilter
+    monkeypatch.setattr(QApplication, "removeEventFilter",
+                        lambda self, obj: (removed.append(obj), original(self, obj)))
+    return removed
+
+
+def send_quit():
+    event = QEvent(QEvent.Type.Quit)
+    QApplication.sendEvent(QApplication.instance(), event)
+    return event
+
+
+def test_quit_on_macos_cleans_up_then_ends_the_process(tray_win, db, backend, monkeypatch,
+                                                       no_process_exit, filters_removed):
+    """AppKit would end the process with exit(), whose C++ teardown crashes in any Python
+    callback (such as this window's application-wide event filter): clean up first,
+    remove the filter, and end the process directly."""
+    import sys
+
+    win, _, _ = tray_win
+    monkeypatch.setattr(sys, "platform", "darwin")
+    m = Macro("hold", [catalog.new_action("key_down"), catalog.new_action("delay")])
+    m.actions[0].params["key"] = "cmd"
+    m.actions[1].params["ms"] = 10_000
+    win.service.run(db.save_macro(m))
+    assert wait_until(lambda: ("down", "cmd") in backend.calls)
+    from keyboardmanager.gui import mainwindow
+
+    at_exit = {}  # a real exit ends everything, so check the state at that moment
+    monkeypatch.setattr(mainwindow, "EXIT_PROCESS", lambda code: (no_process_exit.append(code), at_exit.update(
+        filter_removed=win in filters_removed, keys_released=("up", "cmd") in backend.calls,
+        hotkeys_stopped=win.service.hotkeys.stopped, macro_done=win.service.running_macro is None)))
+    send_quit()
+    assert at_exit == {"filter_removed": True, "keys_released": True,
+                       "hotkeys_stopped": True, "macro_done": True}
+    assert no_process_exit == [0]  # the process ends, with success
+    import sqlite3
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db.list_macros()  # the database was closed before exiting
+    send_quit()
+    assert no_process_exit == [0]  # only once
+
+
+def test_tray_quit_on_macos_ends_the_process(tray_win, monkeypatch, no_process_exit):
+    import sys
+
+    win, _, quits = tray_win
+    monkeypatch.setattr(sys, "platform", "darwin")
+    win.quit()  # QApplication.quit() would now send the Quit event
+    assert quits == [1] and no_process_exit == []
+    send_quit()
+    assert no_process_exit == [0]
+
+
+def test_cancelled_quit_keeps_everything_running(tray_win, monkeypatch, no_process_exit, filters_removed):
+    import sys
+
+    win, _, _ = tray_win
+    monkeypatch.setattr(sys, "platform", "darwin")
+    win._new_macro()
+    win.editor.name_edit.setText("unsaved")
+    answer(monkeypatch, QMessageBox.StandardButton.Cancel)
+    assert not send_quit().isAccepted()
+    assert no_process_exit == [] and filters_removed == [] and not win.service.hotkeys.stopped
+
+
+def test_quit_elsewhere_lets_the_event_loop_finish(tray_win, monkeypatch, no_process_exit, filters_removed):
+    import sys
+
+    win, _, _ = tray_win
+    monkeypatch.setattr(sys, "platform", "linux")
+    send_quit()
+    assert win in filters_removed and win.service.hotkeys.stopped
+    assert no_process_exit == []  # exec() returns normally there; main() finishes up
+
+
+# --------------------------------------------------- sequences and event triggers
+def test_sequence_and_event_markers_in_the_list(win, db):
+    db.save_macro(Macro("Seq", hotkey="ctrl+k ctrl+s"))
+    db.save_macro(Macro("Evt", app_filter="mail", event="focus_gained"))
+    win._reload_macros()
+    texts = {i.text(0) for i in win.list.macro_items()}
+    assert texts == {"Seq  [ctrl+k ctrl+s]", "Evt  (on event)"}
+    assert "Event: When its application gains focus" in win.list.macro_items()[0].toolTip(0)
+    assert "2 on events" not in win.status_label.text()
+    win._update_status()
+    assert "1 on events" in win.status_label.text()
+
+
+def test_sequence_hotkey_conflicts_on_save(win, db, no_modal_boxes):
+    db.save_macro(typing_macro("Long", hotkey="ctrl+k ctrl+s"))
+    win._reload_macros()
+    win._new_macro()
+    ed = win.editor
+    ed.hotkey_edit.setText("ctrl+k")  # how "Long" starts: would always fire first
+    assert not win.save_current()
+    assert "overlaps" in no_modal_boxes[-1][1][2]
+    ed.hotkey_edit.setText("ctrl+k ctrl+s x")
+    assert not win.save_current()
+    ed.hotkey_edit.setText("ctrl+k ctrl+a")  # same first chord alone is fine
+    assert win.save_current()
+    ed.hotkey_edit.setText("ctrl+k ctrl+alt+f12")  # contains the stop hotkey chord
+    assert not win.save_current()
+    assert "reserved" in no_modal_boxes[-1][1][2]
+
+
+def test_stop_hotkey_cannot_be_a_chord_of_a_macro_sequence(win, db, monkeypatch, no_modal_boxes):
+    db.save_macro(typing_macro(hotkey="ctrl+k ctrl+u"))
+    win._reload_macros()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("ctrl+u", True))
+    win._change_stop_hotkey()
+    assert no_modal_boxes[-1][0] == "warning" and "ctrl+k ctrl+u" in no_modal_boxes[-1][1][2]
+    assert win.service.stop_hotkey == "ctrl+alt+f12"

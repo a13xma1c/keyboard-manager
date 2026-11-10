@@ -13,8 +13,11 @@ from keyboardmanager.core import keys
 from keyboardmanager.core.models import Action
 
 MAX_DELAY_MS = 3_600_000
-CONDITION_KINDS = ("app", "title", "time", "variable")
-COMPARE_OPS = ("==", "!=", ">", "<", ">=", "<=", "contains")
+CONDITION_KINDS = ("app", "title", "time", "variable", "expression", "image")
+COMPARE_OPS = ("==", "!=", ">", "<", ">=", "<=", "contains", "starts with", "ends with", "matches", "is empty")
+VARIABLE_MODES = ("set", "add", "subtract", "append", "calculate", "expression")
+VARIABLE_SCOPES = ("run", "saved")
+TIMEOUT_ACTIONS = ("error", "continue")
 MOUSE_BUTTONS = ("left", "right", "middle")
 MOUSE_STATES = ("click", "press", "release")
 
@@ -23,7 +26,7 @@ MOUSE_STATES = ("click", "press", "release")
 class Field:
     name: str
     label: str
-    kind: str  # text | combo | key | int | float | bool | choice
+    kind: str  # text | multiline | code | macro | combo | key | int | float | bool | choice | image
     default: Any = ""
     choices: tuple[str, ...] = ()
     minimum: float = 0
@@ -47,6 +50,29 @@ _COND_SHOW = {
     "value": ("kind", ("app", "title", "time")),
     "variable": ("kind", ("variable",)),
 }
+_IMAGE_HINT = "a screenshot of what to look for (PNG); capture it with the button"
+_TOLERANCE_HINT = ("0 = the pixels must match exactly; higher allows small colour "
+                   "differences (slower)")
+_PLACEHOLDER_HINT = "{name} inserts a variable, e.g. {date}, {clipboard}, {counter}; {= expression} a result"
+
+
+def _condition_fields() -> tuple[Field, ...]:
+    return (
+        Field("kind", "Condition", "choice", "app", CONDITION_KINDS),
+        Field("value", "Value", "text", "",
+              show_if=_COND_SHOW["value"],
+              hint="app/title: text to look for; time: HH:MM-HH:MM"),
+        Field("variable", "Variable", "text", "", show_if=_COND_SHOW["variable"]),
+        Field("op", "Operator", "choice", "==", COMPARE_OPS, show_if=_COND_SHOW["variable"]),
+        Field("compare_to", "Compare to", "text", "", show_if=_COND_SHOW["variable"],
+              hint="matches: a regular expression. " + _PLACEHOLDER_HINT),
+        Field("expression", "Expression", "text", "", show_if=("kind", ("expression",)),
+              hint='e.g. len(clipboard) > 10 and "Mail" in app'),
+        Field("image", "Image", "image", "", show_if=("kind", ("image",)), hint=_IMAGE_HINT),
+        Field("tolerance", "Tolerance", "int", 0, maximum=255, show_if=("kind", ("image",)),
+              hint=_TOLERANCE_HINT),
+        Field("negate", "Negate (NOT)", "bool", False),
+    )
 
 SPECS: dict[str, ActionSpec] = {
     s.type: s
@@ -61,9 +87,15 @@ SPECS: dict[str, ActionSpec] = {
         ActionSpec(
             "type_text", "Type text", "Keyboard",
             (
-                Field("text", "Text", "text", ""),
+                Field("text", "Text", "multiline", "", hint=_PLACEHOLDER_HINT),
                 Field("interval_ms", "Delay per character (ms)", "int", 0, maximum=5000),
             ),
+        ),
+        ActionSpec(
+            "paste_text", "Paste text", "Keyboard",
+            (Field("text", "Text", "multiline", "", hint=_PLACEHOLDER_HINT),),
+            help="Puts the text on the clipboard and pastes it: fast, and works for any "
+                 "characters. The previous clipboard content is restored afterwards.",
         ),
         ActionSpec(
             "mouse_move", "Move mouse", "Mouse",
@@ -108,35 +140,138 @@ SPECS: dict[str, ActionSpec] = {
             help="Runs the nested actions several times. Variable 'iteration' holds the loop number.",
         ),
         ActionSpec(
-            "if", "If / else", "Flow",
-            (
-                Field("kind", "Condition", "choice", "app", CONDITION_KINDS),
-                Field("value", "Value", "text", "",
-                      show_if=_COND_SHOW["value"],
-                      hint="app/title: text to look for; time: HH:MM-HH:MM"),
-                Field("variable", "Variable", "text", "", show_if=_COND_SHOW["variable"]),
-                Field("op", "Operator", "choice", "==", COMPARE_OPS, show_if=_COND_SHOW["variable"]),
-                Field("compare_to", "Compare to", "text", "", show_if=_COND_SHOW["variable"]),
-                Field("negate", "Negate (NOT)", "bool", False),
-            ),
+            "while", "While (loop)", "Flow",
+            (*_condition_fields(),
+             Field("max_iterations", "At most (times)", "int", 1000, minimum=1, maximum=1_000_000)),
+            container=True,
+            help="Repeats the nested actions as long as the condition holds (checked before "
+                 "each round). Variable 'iteration' holds the round number.",
+        ),
+        ActionSpec("break", "Break (leave loop)", "Flow", help="Leaves the innermost Repeat or While loop."),
+        ActionSpec(
+            "if", "If / else", "Flow", _condition_fields(),
             container=True,
             has_else=True,
             help="Runs 'then' actions when the condition holds, otherwise the 'else' actions.",
         ),
         ActionSpec(
-            "set_variable", "Set variable", "Flow",
+            "run_macro", "Run another macro", "Flow",
+            (Field("name", "Macro", "macro", ""),),
+            help="Runs another macro's steps here, sharing this run's variables.",
+        ),
+        ActionSpec(
+            "wait_for_window", "Wait for window", "Flow",
             (
-                Field("name", "Name", "text", "counter"),
-                Field("value", "Value", "text", "0"),
-                Field("mode", "Mode", "choice", "set", ("set", "add")),
+                Field("kind", "Wait until the", "choice", "app", ("app", "title")),
+                Field("value", "contains", "text", "", hint="part of the application name or window title"),
+                Field("timeout_s", "Timeout (seconds)", "int", 10, minimum=1, maximum=3600),
+                Field("on_timeout", "On timeout", "choice", "error", TIMEOUT_ACTIONS),
             ),
+            help="Waits until the focused application (or window title) contains the text.",
         ),
         ActionSpec("stop", "Stop macro", "Flow", help="Ends the macro immediately."),
+        ActionSpec(
+            "comment", "Comment", "Flow", (Field("text", "Note", "text", ""),),
+            help="A note for yourself; does nothing when the macro runs.",
+        ),
+        ActionSpec(
+            "set_variable", "Set variable", "Data",
+            (
+                Field("name", "Name", "text", "counter"),
+                Field("value", "Value", "text", "0",
+                      hint=_PLACEHOLDER_HINT + "; calculate: e.g. {counter} * 2; expression: e.g. upper(name)"),
+                Field("mode", "Mode", "choice", "set", VARIABLE_MODES),
+                Field("scope", "Keep", "choice", "run", VARIABLE_SCOPES,
+                      hint="run: only during this run; saved: kept for later runs and all macros"),
+            ),
+        ),
+        ActionSpec(
+            "ask", "Ask for input", "Data",
+            (
+                Field("prompt", "Question", "text", "Value?"),
+                Field("variable", "Store in variable", "text", "answer"),
+                Field("default", "Suggested answer", "text", ""),
+            ),
+            help="Shows a question; the answer is stored in a variable. Cancel stops the macro.",
+        ),
+        ActionSpec(
+            "script", "Run script", "Data",
+            (Field("code", "Script", "code", 'name = upper(name)\ntype("Hello " + name)'),),
+            help="Statements in a small Python-like language: variables, if / while / for and "
+                 "commands such as type(), press(), wait(), run(). See the Variables tab.",
+        ),
+        ActionSpec(
+            "set_clipboard", "Set clipboard", "Data",
+            (Field("text", "Text", "multiline", "", hint=_PLACEHOLDER_HINT),),
+        ),
+        ActionSpec(
+            "wait_for_image", "Wait for image", "Vision",
+            (
+                Field("image", "Image", "image", "", hint=_IMAGE_HINT),
+                Field("until", "Wait until it", "choice", "appears", ("appears", "disappears")),
+                Field("timeout_s", "Timeout (seconds)", "int", 10, minimum=1, maximum=3600),
+                Field("tolerance", "Tolerance", "int", 0, maximum=255, hint=_TOLERANCE_HINT),
+                Field("on_timeout", "On timeout", "choice", "error", TIMEOUT_ACTIONS),
+            ),
+            help="Waits until the image is (or is no longer) somewhere on the screen. "
+                 "Variables: found_x / found_y (the middle of the match) and timed_out.",
+        ),
+        ActionSpec(
+            "click_image", "Click image", "Vision",
+            (
+                Field("image", "Image", "image", "", hint=_IMAGE_HINT),
+                Field("button", "Button", "choice", "left", MOUSE_BUTTONS),
+                Field("count", "Click count", "int", 1, minimum=1, maximum=10),
+                Field("offset_x", "Offset X", "int", 0, minimum=-10000, maximum=10000,
+                      hint="click this far from the middle of the match"),
+                Field("offset_y", "Offset Y", "int", 0, minimum=-10000, maximum=10000),
+                Field("move_only", "Only move the mouse (no click)", "bool", False),
+                Field("timeout_s", "Wait for it up to (seconds)", "int", 5, minimum=1, maximum=3600),
+                Field("tolerance", "Tolerance", "int", 0, maximum=255, hint=_TOLERANCE_HINT),
+                Field("on_timeout", "If it does not appear", "choice", "error", TIMEOUT_ACTIONS),
+            ),
+            help="Finds the image on the screen, moves the mouse to the middle of the match "
+                 "and clicks. Variables: found_x / found_y and timed_out.",
+        ),
+        ActionSpec(
+            "focus_window", "Focus window", "Vision",
+            (
+                Field("app", "Application", "text", "", hint="e.g. chrome, code (as in the Application filter)"),
+                Field("title", "Window title", "text", "", hint="part of the window title"),
+                Field("timeout_s", "Timeout (seconds)", "int", 5, minimum=1, maximum=3600),
+                Field("on_timeout", "On timeout", "choice", "error", TIMEOUT_ACTIONS),
+            ),
+            help="Brings a window of another application to the front (best effort; on macOS "
+                 "the application is activated as a whole). Variable: timed_out.",
+        ),
+        ActionSpec(
+            "switch_profile", "Switch profile", "System",
+            (Field("profile", "Profile", "text", "", hint="empty = All profiles"),),
+            help="Changes the active profile, as the toolbar does.",
+        ),
+        ActionSpec(
+            "switch_layer", "Switch layer", "System",
+            (
+                Field("layer", "Layer", "text", "", hint="empty = back to the base layer"),
+                Field("one_shot", "One shot (back to base after the next hotkey)", "bool", False),
+            ),
+            help="Changes the active keymap layer: hotkeys and abbreviations of macros on "
+                 "other layers stop working, those on this layer start working.",
+        ),
+        ActionSpec(
+            "launch", "Open app, file or URL", "System",
+            (Field("target", "Open", "text", "", hint="e.g. https://example.com, a file path or an application name"),),
+        ),
+        ActionSpec(
+            "notify", "Show notification", "System",
+            (Field("title", "Title", "text", "Keyboard Manager"),
+             Field("message", "Message", "text", "", hint=_PLACEHOLDER_HINT)),
+        ),
     )
 }
 
-# Only these types are offered as "flow containers".
-CATEGORIES = ("Keyboard", "Mouse", "Flow")
+CATEGORIES = ("Keyboard", "Mouse", "Flow", "Data", "Vision", "System")
+LOOP_TYPES = ("repeat", "while")
 
 
 def spec_for(action_type: str) -> ActionSpec:
@@ -178,7 +313,7 @@ def parse_time_range(text: str) -> tuple[int, int]:
     return h1 * 60 + m1, h2 * 60 + m2
 
 
-def validate_action(action: Action, path: str = "") -> list[str]:
+def validate_action(action: Action, path: str = "", in_loop: bool = False) -> list[str]:
     """Return human readable problems for ``action`` and all nested actions."""
     where = path or action.type
     try:
@@ -200,7 +335,7 @@ def validate_action(action: Action, path: str = "") -> list[str]:
         elif f.kind == "choice":
             if value not in f.choices:
                 errors.append(f"{where}: '{f.label}' must be one of {', '.join(f.choices)}")
-        elif not isinstance(value, str):
+        elif not isinstance(value, str):  # text, multiline, macro, key, combo
             errors.append(f"{where}: '{f.label}' must be text")
 
     if errors:
@@ -216,17 +351,52 @@ def validate_action(action: Action, path: str = "") -> list[str]:
         elif t == "type_text":
             if not get_param(action, "text"):
                 errors.append(f"{where}: text is empty")
-        elif t == "if":
+        elif t in ("if", "while"):
             kind = get_param(action, "kind")
             if kind in ("app", "title") and not get_param(action, "value").strip():
                 errors.append(f"{where}: condition value is empty")
+            elif kind == "image" and not get_param(action, "image").strip():
+                errors.append(f"{where}: choose the image to look for")
             elif kind == "time":
                 parse_time_range(get_param(action, "value"))
-            elif kind == "variable" and not get_param(action, "variable").strip():
-                errors.append(f"{where}: variable name is empty")
+            elif kind == "expression":
+                from keyboardmanager.core.script import check_expression
+
+                check_expression(get_param(action, "expression") or " ")
+            elif kind == "variable":
+                _check_variable_name(get_param(action, "variable"))
+                pattern = get_param(action, "compare_to")
+                if get_param(action, "op") == "matches" and "{" not in pattern:
+                    try:
+                        re.compile(pattern)
+                    except re.error as exc:
+                        raise ValueError(f"invalid regular expression: {exc}") from None
         elif t == "set_variable":
-            if not get_param(action, "name").strip():
-                errors.append(f"{where}: variable name is empty")
+            _check_variable_name(get_param(action, "name"))
+            if get_param(action, "mode") == "expression":
+                from keyboardmanager.core.script import check_expression
+
+                check_expression(get_param(action, "value") or " ")
+        elif t == "script":
+            from keyboardmanager.core.script import check_script
+
+            check_script(get_param(action, "code"))
+        elif t == "ask":
+            _check_variable_name(get_param(action, "variable"))
+        elif t == "paste_text" and not get_param(action, "text"):
+            errors.append(f"{where}: text is empty")
+        elif t == "run_macro" and not get_param(action, "name").strip():
+            errors.append(f"{where}: choose the macro to run")
+        elif t == "launch" and not get_param(action, "target").strip():
+            errors.append(f"{where}: say what to open")
+        elif t == "wait_for_window" and not get_param(action, "value").strip():
+            errors.append(f"{where}: say which window to wait for")
+        elif t in ("wait_for_image", "click_image") and not get_param(action, "image").strip():
+            errors.append(f"{where}: choose the image to look for")
+        elif t == "focus_window" and not (get_param(action, "app").strip() or get_param(action, "title").strip()):
+            errors.append(f"{where}: say which window to focus (application and/or title)")
+        elif t == "break" and not in_loop:
+            errors.append(f"{where}: Break only works inside a Repeat or While loop")
     except ValueError as exc:
         errors.append(f"{where}: {exc}")
 
@@ -235,11 +405,21 @@ def validate_action(action: Action, path: str = "") -> list[str]:
     if not spec.has_else and action.else_children:
         errors.append(f"{where}: this action has no else branch")
 
+    inner_loop = in_loop or t in LOOP_TYPES
     for i, child in enumerate(action.children, 1):
-        errors += validate_action(child, f"{where} > then #{i}" if spec.has_else else f"{where} > #{i}")
+        errors += validate_action(child, f"{where} > then #{i}" if spec.has_else else f"{where} > #{i}", inner_loop)
     for i, child in enumerate(action.else_children, 1):
-        errors += validate_action(child, f"{where} > else #{i}")
+        errors += validate_action(child, f"{where} > else #{i}", inner_loop)
     return errors
+
+
+def _check_variable_name(name: str) -> None:
+    from keyboardmanager.core.variables import valid_name
+
+    if not name.strip():
+        raise ValueError("variable name is empty")
+    if not valid_name(name.strip()):
+        raise ValueError(f"{name!r} is not a valid variable name (letters, digits and _)")
 
 
 def validate_actions(actions: list[Action]) -> list[str]:
@@ -257,9 +437,24 @@ def describe_condition(action: Action) -> str:
         text = f'window title contains "{get_param(action, "value")}"'
     elif kind == "time":
         text = f"time is between {get_param(action, 'value')}"
+    elif kind == "expression":
+        text = get_param(action, "expression")
+    elif kind == "image":
+        text = f'{_file_name(get_param(action, "image"))} is on the screen'
+    elif get_param(action, "op") == "is empty":
+        text = f'{get_param(action, "variable")} is empty'
     else:
         text = f'{get_param(action, "variable")} {get_param(action, "op")} "{get_param(action, "compare_to")}"'
     return f"NOT ({text})" if get_param(action, "negate") else text
+
+
+def _file_name(path: str) -> str:
+    return path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or path
+
+
+def _short(text: str, limit: int = 40) -> str:
+    text = text.replace("\n", " \u23ce ")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def describe(action: Action) -> str:
@@ -273,9 +468,7 @@ def describe(action: Action) -> str:
     if t == "key_up":
         return f"Release {p('key')}"
     if t == "type_text":
-        text = p("text")
-        shown = text if len(text) <= 40 else text[:37] + "..."
-        return f'Type "{shown}"'
+        return f'Type "{_short(p("text"))}"'
     if t == "mouse_move":
         return f"Move mouse {'by' if p('relative') else 'to'} ({p('x')}, {p('y')})"
     if t == "mouse_click":
@@ -295,10 +488,53 @@ def describe(action: Action) -> str:
     if t == "if":
         return f"If {describe_condition(action)}"
     if t == "set_variable":
-        op = "+=" if p("mode") == "add" else "="
-        return f'Set {p("name")} {op} "{p("value")}"'
+        op = {"set": "=", "add": "+=", "subtract": "-=", "append": "append", "calculate": "= calc",
+              "expression": "= expr"}[p("mode")]
+        saved = " (saved)" if p("scope") == "saved" else ""
+        return f'Set {p("name")}{saved} {op} "{_short(p("value"))}"'
     if t == "stop":
         return "Stop macro"
+    if t == "script":
+        lines = [line for line in p("code").splitlines() if line.strip()]
+        first = lines[0].strip() if lines else ""
+        return f"Script: {_short(first, 36)}" + (f" (+{len(lines) - 1} lines)" if len(lines) > 1 else "")
+    if t == "paste_text":
+        return f'Paste "{_short(p("text"))}"'
+    if t == "while":
+        return f"While {describe_condition(action)}"
+    if t == "break":
+        return "Break out of the loop"
+    if t == "run_macro":
+        return f'Run macro "{p("name")}"'
+    if t == "wait_for_window":
+        what = "application" if p("kind") == "app" else "window title"
+        return f'Wait until the {what} contains "{p("value")}" (max {p("timeout_s")} s)'
+    if t == "wait_for_image":
+        return f'Wait until {_file_name(p("image"))} {p("until")} (max {p("timeout_s")} s)'
+    if t == "click_image":
+        doing = "Move mouse to" if p("move_only") else f"{p('button').capitalize()} click"
+        n = p("count")
+        times = f" x{n}" if n > 1 and not p("move_only") else ""
+        return f'{doing}{times} {_file_name(p("image"))}'
+    if t == "focus_window":
+        wanted = " / ".join(x for x in (p("app").strip(), p("title").strip()) if x)
+        return f'Focus window "{wanted}"'
+    if t == "switch_profile":
+        return f'Switch to profile "{p("profile")}"' if p("profile").strip() else "Switch to All profiles"
+    if t == "switch_layer":
+        if not p("layer").strip():
+            return "Back to the base layer"
+        return f'Switch to layer "{p("layer")}"' + (" (one shot)" if p("one_shot") else "")
+    if t == "comment":
+        return f"# {p('text')}"
+    if t == "ask":
+        return f'Ask "{_short(p("prompt"))}" -> {p("variable")}'
+    if t == "set_clipboard":
+        return f'Set clipboard to "{_short(p("text"))}"'
+    if t == "launch":
+        return f'Open "{_short(p("target"))}"'
+    if t == "notify":
+        return f'Notify "{_short(p("message") or p("title"))}"'
     return t
 
 

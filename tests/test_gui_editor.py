@@ -41,7 +41,7 @@ def test_add_menu_lists_every_step_type(ed, dialogs):
     assert ed.dirty
 
 
-def test_cancelled_add_and_edit_change_nothing(ed, dialogs):
+def test_cancelled_add_and_edit_change_nothing(ed, dialogs, monkeypatch):
     dialogs[0] = ActionDialog.DialogCode.Rejected
     assert ed.add_step("delay") is None and ed.actions == [] and not ed.dirty
     dialogs[0] = ActionDialog.DialogCode.Accepted
@@ -51,9 +51,13 @@ def test_cancelled_add_and_edit_change_nothing(ed, dialogs):
     ed.tree.setCurrentItem(ed._find_item(step))
     ed._edit_selected()
     assert not ed.dirty
-    dialogs[0] = ActionDialog.DialogCode.Accepted
+    def edit(dialog):  # an accepted dialog that really changes something
+        dialog._action.params["ms"] = 999
+        return ActionDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ActionDialog, "exec", edit)
     ed.tree.itemDoubleClicked.emit(ed._find_item(step), 0)
-    assert ed.dirty
+    assert ed.dirty and step.params["ms"] == 999
 
 
 def test_steps_without_fields_skip_the_dialog(ed, monkeypatch):
@@ -144,9 +148,12 @@ class _FakeSession:
 def recording(monkeypatch):
     from keyboardmanager.gui.recording import RecordOptionsDialog
 
+    from keyboardmanager.gui.recording import RecordReviewDialog
+
     monkeypatch.setattr(editor_mod, "RecordingSession", _FakeSession)
     accepted = [RecordOptionsDialog.DialogCode.Accepted]
     monkeypatch.setattr(RecordOptionsDialog, "exec", lambda self: accepted[0])
+    monkeypatch.setattr(RecordReviewDialog, "exec", lambda self: RecordReviewDialog.DialogCode.Accepted)
     _FakeSession.result, _FakeSession.fail = [], False
     return accepted
 
@@ -200,3 +207,29 @@ def test_drag_and_drop_rules(ed):
     assert ed.dirty and [a.type for a in ed.actions] == ["repeat", "if", "key_press"]
     assert isinstance(ed._find_item(rep), QTreeWidgetItem) and ed._find_item(rep).data(0, ROLE_KIND) == "action"
     assert ed._find_item(rep).data(0, ROLE_ACTION) is rep
+
+
+def test_event_trigger_round_trip_and_validation(ed):
+    labels = [ed.event_combo.itemText(i) for i in range(ed.event_combo.count())]
+    assert labels[0] == "Not on an event" and "When Keyboard Manager starts" in labels
+    ed.name_edit.setText("m")
+    ed.event_combo.setCurrentIndex(ed.event_combo.findData("focus_gained"))
+    assert ed.dirty
+    with pytest.raises(ValueError, match="filter"):
+        ed.build_macro()  # a focus event needs an application / window filter
+    ed.app_edit.setText("chrome")
+    built = ed.build_macro()
+    assert built.event == "focus_gained"
+    ed.load(built)
+    assert ed.event_combo.currentData() == "focus_gained" and not ed.dirty
+    ed.load(Macro("fresh"))
+    assert ed.event_combo.currentData() == ""
+
+
+def test_hotkey_sequences_are_normalized_on_build(ed):
+    ed.name_edit.setText("m")
+    ed.hotkey_edit.setText("Ctrl+K  Shift+S")
+    assert ed.build_macro().hotkey == "ctrl+k shift+s"
+    ed.hotkey_edit.setText("ctrl+k nope+x")
+    with pytest.raises(ValueError, match="hotkey"):
+        ed.build_macro()

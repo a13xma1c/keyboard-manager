@@ -220,6 +220,7 @@ def test_pynput_hotkeys_registers_layout_aware_listener(monkeypatch):
         def stop(self):
             created["stopped"] = True
 
+
     monkeypatch.setattr(hotkeys, "layout_aware_hotkeys_class", lambda: FakeListener)
     monkeypatch.setattr(backend_mod, "darwin_base_chars", lambda: US_BASE)
     hk = hotkeys.PynputHotkeys()
@@ -235,6 +236,145 @@ def test_keyboard_package_never_used_on_mac(mac, monkeypatch):
     monkeypatch.setitem(sys.modules, "keyboard", None)  # importing it would now fail loudly
     for kind in ("auto", "keyboard", "pynput"):
         assert isinstance(hotkeys.create_hotkey_backend(kind), hotkeys.PynputHotkeys)
+
+
+# ------------------------------------------- main-thread-only macOS APIs
+@pytest.fixture
+def fake_pynput_darwin(mac, fake_modules):
+    """Stand-in for pynput's macOS listener internals that records which thread
+    calls the keyboard-layout (TIS) APIs and whether the event loop ran."""
+    import threading
+    from contextlib import contextmanager
+
+    log = {"tis_threads": [], "loop_ran": False, "context_in_loop": "unset"}
+
+    @contextmanager
+    def keycode_context():
+        log["tis_threads"].append(threading.current_thread())
+        yield ("kbd-type", b"layout")
+
+    class ListenerMixin:
+        def _run(self):
+            log["loop_ran"] = True
+            log["context_in_loop"] = self._context
+
+    class DarwinListener(ListenerMixin, threading.Thread):  # what pynput does
+        def __init__(self):
+            super().__init__(daemon=True)
+            self._context = None
+
+        def _run(self):
+            with keycode_context() as context:  # on the listener's own thread!
+                self._context = context
+                try:
+                    super()._run()
+                finally:
+                    self._context = None
+
+        def run(self):
+            self._run()
+
+    fake_modules(**{"pynput._util.darwin": {
+        "ListenerMixin": ListenerMixin, "keycode_context": keycode_context,
+        "keycode_to_string": lambda ctx, vk: "s" if vk == 1 else ""}})
+    return log, DarwinListener
+
+
+def test_stock_macos_listener_calls_tis_off_the_main_thread(fake_pynput_darwin):
+    """Documents the pynput behaviour that crashes the app on macOS."""
+    import threading
+
+    log, DarwinListener = fake_pynput_darwin
+    listener = DarwinListener()
+    listener.start()
+    listener.join(2)
+    assert log["tis_threads"] and log["tis_threads"][0] is not threading.main_thread()
+
+
+def test_safe_listener_uses_tis_only_on_the_main_thread(fake_pynput_darwin):
+    import threading
+
+    log, DarwinListener = fake_pynput_darwin
+    safe = backend_mod.safe_listener(DarwinListener)
+    assert safe is not DarwinListener and issubclass(safe, DarwinListener)
+    for _ in range(5):  # e.g. toggling hotkeys repeatedly
+        listener = safe()
+        listener.start()
+        listener.join(2)
+    assert log["tis_threads"] == [threading.main_thread()] * 5  # once per listener, on main
+    assert log["loop_ran"] and log["context_in_loop"] == ("kbd-type", b"layout")
+
+
+def test_safe_listener_elsewhere_keeps_pynputs_own_run(fake_pynput_darwin, monkeypatch):
+    import threading
+
+    log, DarwinListener = fake_pynput_darwin
+    monkeypatch.setattr(sys, "platform", "linux")  # not macOS: no TIS workaround
+    listener = backend_mod.safe_listener(DarwinListener)()
+    listener.start()
+    listener.join(2)
+    assert log["loop_ran"]  # the original _run ran...
+    assert log["tis_threads"] and log["tis_threads"][0] is not threading.main_thread()  # ...unchanged
+
+
+def test_layout_table_is_never_read_off_the_main_thread(fake_pynput_darwin):
+    import threading
+
+    log, _ = fake_pynput_darwin
+    assert backend_mod.darwin_base_chars() == {1: "s"}
+    result = {}
+    worker = threading.Thread(target=lambda: result.update(table=backend_mod.darwin_base_chars()))
+    worker.start()
+    worker.join(2)
+    assert result["table"] == {1: "s"}  # the previous table, without calling TIS
+    assert log["tis_threads"] == [threading.main_thread()]
+
+
+def test_stopping_never_calls_cfrunloopstop_with_null(mac, fake_modules):
+    """pynput: "if self._loop is not None: CFRunLoopStop(self._loop)" reads _loop twice;
+    if the listener thread clears it in between, CFRunLoopStop(NULL) segfaults."""
+    calls = []
+
+    class ListenerMixin:
+        def _run(self):
+            pass
+
+        def _stop_platform(self):  # pynput's code
+            if self._loop is not None:
+                calls.append(("pynput", self._loop))
+
+    class DarwinListener(ListenerMixin):
+        def __init__(self):
+            self._running = True
+
+        def stop(self):
+            self._running = False
+            self._stop_platform()
+
+    fake_modules(**{"pynput._util.darwin": {"ListenerMixin": ListenerMixin,
+                                             "keycode_context": None, "keycode_to_string": None},
+                    "Quartz": {"CFRunLoopStop": lambda loop: calls.append(("safe", loop))}})
+
+    def exiting_thread(base):
+        class ThreadExitsDuringStop(base):
+            reads = 0
+
+            @property
+            def _loop(self):  # the first read sees the loop, later ones None
+                type(self).reads += 1
+                return "run-loop" if type(self).reads == 1 else None
+
+            @_loop.setter
+            def _loop(self, value):
+                pass
+
+        return ThreadExitsDuringStop()
+
+    exiting_thread(DarwinListener).stop()
+    assert calls == [("pynput", None)]  # the crash: NULL passed on
+    calls.clear()
+    exiting_thread(backend_mod.safe_listener(DarwinListener)).stop()
+    assert calls == [("safe", "run-loop")]
 
 
 # ---------------------------------------------------------------- recording
@@ -289,9 +429,11 @@ def test_key_capture_maps_mac_modifiers(qapp, monkeypatch):
     w.show()
     w.button.setChecked(True)
     QTest.keyClick(w.button, Qt.Key.Key_K, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
+    w.button.setChecked(False)  # finish the (single-chord) sequence
     assert w.text() == "alt+cmd+k" and w.normalized() == "alt+cmd+k"
     w.button.setChecked(True)
     QTest.keyClick(w.button, Qt.Key.Key_J, Qt.KeyboardModifier.MetaModifier)
+    w.button.setChecked(False)
     assert w.normalized() == "ctrl+j"
 
 
@@ -344,10 +486,35 @@ def test_native_layout_table_and_window_lookup():
 
 @native
 @on_mac
-def test_native_keyboard_package_not_installed():
-    import importlib.util
+def test_native_keyboard_package_is_never_imported():
+    """Importing `keyboard` aborts the interpreter on macOS, so the app must never do it,
+    even when the package is present (e.g. a virtualenv created by an older version)."""
+    import subprocess
+    import textwrap
 
-    assert importlib.util.find_spec("keyboard") is None
+    script = textwrap.dedent("""
+        import sys
+        from keyboardmanager import app
+        from keyboardmanager.core import hotkeys
+        from keyboardmanager.gui import mainwindow
+        for kind in ("auto", "keyboard", "pynput"):
+            hotkeys.create_hotkey_backend(kind).start({"ctrl+alt+f12": lambda: None})
+        assert "keyboard" not in sys.modules, "keyboard was imported"
+    """)
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+
+@native
+@on_mac
+def test_native_package_metadata_excludes_keyboard_on_mac():
+    from importlib.metadata import requires
+
+    from packaging.requirements import Requirement
+
+    reqs = [Requirement(r) for r in requires("keyboardmanager") or []]
+    active = {r.name.lower() for r in reqs if r.marker is None or r.marker.evaluate()}
+    assert "keyboard" not in active and "pyobjc-framework-quartz" in active
 
 
 @native

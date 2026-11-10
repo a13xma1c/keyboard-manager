@@ -95,3 +95,27 @@ def test_data_survives_a_restart(app, tmp_path, backend):
     assert [m.name for m in db.list_macros()] == ["Keep me"]
     assert set(again.hotkeys.mapping) >= {"ctrl+alt+k", "ctrl+shift+f12"}
     service.db = db  # let the fixture close the reopened connection
+
+
+def test_sequence_hotkey_and_focus_event_end_to_end(app, backend):
+    win, service, hk, _, pump = app
+    build_in_editor(win, "Save all", "ctrl+k ctrl+s", text="saved!")
+    win._new_macro()
+    win.editor.name_edit.setText("Greet mail")
+    win.editor.app_edit.setText("mail")
+    win.editor.event_combo.setCurrentIndex(win.editor.event_combo.findData("focus_gained"))
+    win.editor.add_step("type_text", edit=False).params["text"] = "Dear "
+    assert win.save_current()
+
+    hk.mapping["ctrl+k"]()
+    hk.mapping["ctrl+s"]()
+    assert pump(lambda: ("type", "saved!") in backend.calls and service.running_macro is None)
+
+    service.events.check()  # baseline look at the focused window (the poll thread's job)
+    backend.window = __import__("keyboardmanager.core.models", fromlist=["ActiveWindow"]).ActiveWindow("Mail", "Inbox")
+    service.events.check()
+    assert pump(lambda: ("type", "Dear ") in backend.calls and service.running_macro is None)
+    win.tabs.setCurrentWidget(win.history)
+    assert pump(lambda: win.history.table.rowCount() == 2)
+    triggers = {win.history.table.item(r, 2).text() for r in range(2)}
+    assert triggers == {"hotkey ctrl+k ctrl+s", "event: When its application gains focus"}
